@@ -53,6 +53,22 @@ NETSCAPE_REFERENCE = [
 # The /json/list reply a real Chrome gave, decoy targets included.
 CDP_TARGETS = json.loads((FIXTURES / "cdp-targets.json").read_text(encoding="utf-8"))
 
+# Real platform subtitle bytes, cut from the tracks yt-dlp wrote for parts 12
+# and 18. Cut by line range rather than by byte offset, because a byte slice
+# can drop the blank line that terminates the last block, which changes the
+# segment count.
+#   p12  55 segments, 3606 bytes, sha256 ee045224bfeec20c31868763d7334a4990bcbe7b2545504f27ba3449a62c1d27
+#   p18   9 segments,  493 bytes, sha256 20c02c4a80129718c3d0bb9e74629d43b622b3b6a295af92d1c72bfff9d86fb0
+SRT_P12 = (FIXTURES / "subtitles-p12-slice.srt").read_text(encoding="utf-8")
+SRT_P18 = (FIXTURES / "subtitles-p18-slice.srt").read_text(encoding="utf-8")
+
+# What `--print "%(requested_subtitles)j"` wrote for two real parts. The SRT
+# text arrives inside the JSON, so there is no file to find afterwards.
+SUB_PRINT_PART = (FIXTURES / "subtitle-print-part.txt").read_text(encoding="utf-8")
+SUB_PRINT_NO_TRACK = (FIXTURES / "subtitle-print-no-track.txt").read_text(
+    encoding="utf-8"
+)
+
 
 def rows(text: str) -> list[str]:
     """The data lines of a Netscape cookie file, comments dropped."""
@@ -865,6 +881,234 @@ class LoginCommand(unittest.TestCase):
             code = videokit.main(["login"])
         self.assertNotEqual(code, 0)
         self.assertIn("chrome.exe not found", buffer.getvalue())
+
+
+class ParseSrt(unittest.TestCase):
+    """Parsing real platform subtitle bytes into timed segments.
+
+    Expected values are read off the fixture by hand and written here as
+    literals, so a parser that quietly drops or invents segments fails. The
+    counts match the per-file figures measured across all 21 real tracks.
+    """
+
+    def test_yields_one_segment_per_block(self):
+        segments = videokit.parse_srt(SRT_P12)
+        self.assertEqual(len(segments), 55)
+
+    def test_second_fixture_yields_its_own_block_count(self):
+        # A second file, different length, so a parser cannot pass by
+        # returning a constant.
+        self.assertEqual(len(videokit.parse_srt(SRT_P18)), 9)
+
+    def test_parses_the_first_segment_exactly(self):
+        first = videokit.parse_srt(SRT_P12)[0]
+        self.assertEqual(first.start_sec, 835.719)
+        self.assertEqual(first.end_sec, 837.859)
+        self.assertEqual(first.text, "SDR是special drawing rights啊")
+
+    def test_parses_the_last_segment_exactly(self):
+        last = videokit.parse_srt(SRT_P12)[-1]
+        self.assertEqual(last.start_sec, 956.969)
+        self.assertEqual(last.end_sec, 958.649)
+        self.assertEqual(last.text, "也不可能啊")
+
+    def test_text_carries_no_timestamp(self):
+        # The two are separate fields because the two transcript sources have
+        # different timestamp granularity; mixed together, downstream cannot
+        # treat them alike.
+        for segment in videokit.parse_srt(SRT_P12):
+            with self.subTest(text=segment.text):
+                self.assertNotIn("-->", segment.text)
+                self.assertNotIn(":", segment.text[:12])
+
+    def test_segments_are_ordered_by_start_time(self):
+        starts = [s.start_sec for s in videokit.parse_srt(SRT_P12)]
+        self.assertEqual(starts, sorted(starts))
+        self.assertEqual(len(set(starts)), len(starts))
+
+    def test_keeps_adjacent_duplicate_segments(self):
+        # Segments 418 and 419 both read 也不可能啊. They are two different
+        # stretches of speech. Dropping one loses a second of real content, so
+        # the parser must not deduplicate.
+        texts = [s.text for s in videokit.parse_srt(SRT_P12)]
+        run = [t for t in texts[52:] if t == "也不可能啊"]
+        self.assertEqual(len(run), 2)
+
+    def test_keeps_text_that_is_only_digits(self):
+        # A digit-only line must not be mistaken for an index line. p18 has
+        # five such segments in a row.
+        segments = videokit.parse_srt(SRT_P18)
+        self.assertIn("60616263646566676869", [s.text for s in segments])
+        self.assertIn("38485868687888990", [s.text for s in segments])
+
+    def test_reads_milliseconds_that_are_not_multiples_of_ten(self):
+        # Real tracks end on values like 01:48:24,749 and 01:16:30,999. A parser
+        # that assumes a rounded millisecond truncates them.
+        self.assertEqual(videokit.parse_srt(SRT_P18)[0].start_sec, 864.58)
+
+    def test_handles_segments_that_abut_exactly(self):
+        # 46 of the 54 boundaries in p12 are zero-gap. The end of one segment
+        # is the start of the next, with nothing between.
+        segments = videokit.parse_srt(SRT_P12)
+        second = segments[1]
+        self.assertEqual(second.start_sec, segments[0].end_sec)
+
+    def test_keeps_a_segment_as_short_as_a_third_of_a_second(self):
+        shortest = min(s.end_sec - s.start_sec for s in videokit.parse_srt(SRT_P12))
+        self.assertAlmostEqual(shortest, 0.32, places=6)
+
+    def test_empty_input_yields_an_empty_list(self):
+        # Not the same outcome as a missing track. See SubtitleRetrieval.
+        self.assertEqual(videokit.parse_srt(""), [])
+
+    def test_text_is_not_a_container_for_the_index(self):
+        # The index line is not part of the transcript.
+        self.assertNotIn("419", [s.text for s in videokit.parse_srt(SRT_P12)])
+
+
+class SubtitleRetrieval(unittest.TestCase):
+    """Fetching a part's track through the one external seam.
+
+    `_run` is what reaches yt-dlp, so the fake goes there. The distinction the
+    ticket asks for lives in this class: no track raises, an empty parse
+    returns an empty list.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            return videokit.RunOutput(SUB_PRINT_PART, "")
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+
+    def test_returns_the_segments_of_the_requested_part(self):
+        segments = videokit.part_subtitles("https://www.bilibili.com/video/BV1Y5QgB5Eas", 18)
+        self.assertEqual(len(segments), 1078)
+        self.assertEqual(segments[0].text, "呃现在我们来进入到这个货币经济")
+        self.assertEqual(segments[-1].text, "我们就讲到这儿下课")
+
+    def test_segments_are_ordered_and_free_of_timestamps(self):
+        segments = videokit.part_subtitles("u", 18)
+        starts = [s.start_sec for s in segments]
+        self.assertEqual(starts, sorted(starts))
+
+    def test_asks_for_the_part_and_its_language(self):
+        videokit.part_subtitles("https://www.bilibili.com/video/BV1Y5QgB5Eas", 12)
+        args = self.calls[-1]
+        self.assertIn("--write-subs", args)
+        self.assertIn("--sub-langs", args)
+        self.assertEqual(args[args.index("--sub-langs") + 1], "ai-zh")
+        self.assertEqual(args[args.index("--playlist-items") + 1], "12")
+
+    def test_reads_the_track_from_the_printed_payload(self):
+        # yt-dlp writes subtitles to a file, and the file name is not
+        # predictable from the template. The payload on stdout carries the
+        # track text itself, so there is no file to find afterwards.
+        videokit.part_subtitles("u", 12)
+        args = self.calls[-1]
+        idx = args.index("--print")
+        self.assertEqual(args[idx + 1], "%(requested_subtitles)j")
+
+    def test_a_language_other_than_ai_zh_can_be_named(self):
+        # The language is a parameter, not a constant. A payload for another
+        # track must be read back, not rejected because it is not `ai-zh`.
+        def other_language(args, cookies):
+            self.calls.append(args)
+            return videokit.RunOutput(
+                json.dumps(
+                    {
+                        "zh-CN": {
+                            "ext": "srt",
+                            "data": (
+                                "1\n00:00:01,000 --> 00:00:02,500\n人工字幕\n\n"
+                                "2\n00:00:02,500 --> 00:00:04,000\n第二行\n\n"
+                            ),
+                        }
+                    }
+                ),
+                "",
+            )
+
+        videokit._run = other_language
+        segments = videokit.part_subtitles("u", 12, language="zh-CN")
+        self.assertEqual([s.text for s in segments], ["人工字幕", "第二行"])
+        args = self.calls[-1]
+        self.assertEqual(args[args.index("--sub-langs") + 1], "zh-CN")
+
+    def test_a_part_without_a_track_raises_rather_than_returning_empty(self):
+        # The failure mode this ticket exists to prevent. A caller told "an
+        # empty list" would write an empty transcript and never notice.
+        def no_track(args, cookies):
+            self.calls.append(args)
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
+
+        videokit._run = no_track
+        with self.assertRaises(videokit.SubtitleUnavailable) as ctx:
+            videokit.part_subtitles("u", 1)
+        self.assertIn("1", str(ctx.exception))
+
+    def test_the_two_outcomes_are_not_easily_confused(self):
+        # Same part, same call shape. One outcome raises, the other returns a
+        # list. Asserting both here keeps them from being conflated later.
+        def no_track(args, cookies):
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
+
+        videokit._run = no_track
+        raised = False
+        try:
+            videokit.part_subtitles("u", 1)
+        except videokit.SubtitleUnavailable:
+            raised = True
+        self.assertTrue(raised)
+        self.assertIsInstance(videokit.parse_srt(""), list)
+
+    def test_a_track_that_parses_to_nothing_is_also_reported_as_missing(self):
+        # A payload carrying an empty track is not a transcript. Returning []
+        # here would put an empty transcript into the pipeline.
+        def empty_track(args, cookies):
+            return videokit.RunOutput(
+                json.dumps({"ai-zh": {"ext": "srt", "data": ""}}), ""
+            )
+
+        videokit._run = empty_track
+        with self.assertRaises(videokit.SubtitleUnavailable):
+            videokit.part_subtitles("u", 12)
+
+    def test_danmaku_is_not_treated_as_a_subtitle_track(self):
+        # A danmaku-only payload carries no transcribable track, so it means
+        # the same thing as no track at all.
+        def danmaku_only(args, cookies):
+            return videokit.RunOutput(
+                json.dumps({"danmaku": {"ext": "xml", "url": "https://x"}}), ""
+            )
+
+        videokit._run = danmaku_only
+        with self.assertRaises(videokit.SubtitleUnavailable):
+            videokit.part_subtitles("u", 12)
+
+    def test_a_logged_out_run_is_not_reported_as_a_missing_track(self):
+        # Both outcomes look like "no payload" on stdout. With the login
+        # warning on stderr this is the credential's fault, not the part's, and
+        # the two send the caller to different remedies: one re-logs in, the
+        # other queues speech recognition.
+        def logged_out(args, cookies):
+            self.calls.append(args)
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, LOGIN_WARNING)
+
+        videokit._run = logged_out
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.part_subtitles("u", 3)
+        self.assertIn("videokit.py login", str(ctx.exception))
+
+    def test_the_track_data_is_not_read_from_the_filesystem(self):
+        # The fixture is a payload, not a directory. A retrieval path that
+        # relied on a written file could not work from these bytes.
+        segments = videokit.part_subtitles("u", 18)
+        self.assertTrue(all(isinstance(s, videokit.Segment) for s in segments))
 
 
 if __name__ == "__main__":
