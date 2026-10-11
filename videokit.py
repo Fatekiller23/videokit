@@ -946,6 +946,21 @@ def _pending_record(bvid: str, part: Part) -> PartTranscript:
     )
 
 
+def video_url(reference: str) -> str:
+    """Turn a bare BV number into the URL yt-dlp takes.
+
+    `BV1Y5QgB5Eas` is what a user has in hand and `Video.id` holds exactly
+    that, while the extractor needs a URL in the argument position. Handing it
+    the bare identifier fails with `'BV1Y5QgB5Eas' is not a valid URL`,
+    measured against the real program. Both shapes are accepted so neither has
+    to be converted by hand.
+    """
+    reference = reference.strip()
+    if reference.startswith(("http://", "https://")):
+        return reference
+    return f"https://www.bilibili.com/video/{reference}"
+
+
 def _preferred_language(part: Part) -> str:
     """The track to take for a part that has more than one."""
     for preferred in ("ai-zh", "zh-CN", "zh"):
@@ -982,7 +997,7 @@ def part_transcript(
         return _pending_record(video.id, part)
     language = _preferred_language(part)
     try:
-        segments = part_subtitles(video.id, part.index, language, cookies)
+        segments = part_subtitles(video_url(video.id), part.index, language, cookies)
     except SubtitleUnavailable:
         # The probe table and the fetch can disagree, for instance if the
         # track was withdrawn between the two calls. Either way this part
@@ -1126,18 +1141,6 @@ def download_audio(
             "--postprocessor-args", "-ar 16000 -ac 1",
         ],
     )
-
-
-def video_url(reference: str) -> str:
-    """Turn a bare BV number into the URL yt-dlp takes.
-
-    `BV1Y5QgB5Eas` is what a user has in hand, a URL is what the extractor
-    needs. Both are accepted so neither has to be converted by hand.
-    """
-    reference = reference.strip()
-    if reference.startswith(("http://", "https://")):
-        return reference
-    return f"https://www.bilibili.com/video/{reference}"
 
 
 def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:

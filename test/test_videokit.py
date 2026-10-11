@@ -1287,6 +1287,16 @@ class PartJudgment(unittest.TestCase):
         self.assertEqual(args[args.index("--sub-langs") + 1], "ai-zh")
         self.assertEqual(args[args.index("--playlist-items") + 1], "12")
 
+    def test_the_fetch_gets_a_url_and_not_the_bare_bv_number(self):
+        # `Video.id` is `BV1Y5QgB5Eas`. Handing that to yt-dlp in the URL
+        # position fails with `'BV1Y5QgB5Eas' is not a valid URL`, measured
+        # against the real program. A stub that answers whatever it is asked
+        # cannot see this, so the argument itself is asserted.
+        videokit.part_transcript(self.video, self._part(12))
+        self.assertEqual(
+            self.calls[-1][-1], "https://www.bilibili.com/video/BV1Y5QgB5Eas"
+        )
+
     def test_a_part_without_a_track_is_recorded_as_awaiting_asr(self):
         # Not an error and not a failure. It is a part waiting for the ASR
         # path, and it must be tellable from one that already has a transcript.
