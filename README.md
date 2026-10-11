@@ -550,9 +550,15 @@ RecognisedUnit
 
 ## 代码结构
 
-`videokit.py` 是全部实现。分三层。
+`videokit.py` 是全部实现，约 2770 行，按职责从上到下排。
 
-**`_run` 是唯一的网络边界。** 所有 `yt-dlp` 调用都从这里出去。它返回 `RunOutput(stdout, stderr)` 两个流，因为登录告警写在 stderr 而退出码是 0。**模型是第二个边界，在 `transcribe` 的 `engine=` 参数上。** 其余全是纯函数。
+**两个注入边界。** `_run` 是所有 `yt-dlp` 调用的出口，返回 `RunOutput(stdout, stderr)` 两个流，因为登录告警写在 stderr 而退出码是 0。模型是第二个边界，在 `transcribe` 的 `engine=` 参数上。测试只替换这两处。
+
+**两块真正的副作用区，不是纯函数。** 凭据段拉 Chrome、走 CDP、调 `icacls` 降权；交付层往磁盘写文件。这两段的每个动作都有注释写明为什么。
+
+**其余是纯函数**，解析与判定都在这一层：字幕表解析、SRT 解析、识别单元切分、分段、拼接、清晰度映射、参数拼接、汇总行组装。它们吃数据返回数据，不碰网络也不碰磁盘，所以能用录制件离线测。
+
+**一个文件装这么多是有代价的，review 指出来了。** 凭据段是全文唯一 `import websocket`、唯一启非 yt-dlp 子进程、唯一读 `LOCALAPPDATA` 的地方，与交付文稿层零耦合，值得单独切出去。命令行段同理。本轮没切，因为切它要同时改 `pyproject.toml` 的入口与 README 里五条命令、以及测试里 29 处 `videokit.main` 引用，收益不抵这轮的改动面。留作后续。
 
 **`probe` 用两次 `yt-dlp` 调用，这是 B 站提取器的现状，不是设计偏好。**
 
@@ -744,6 +750,16 @@ uv run --python 3.12 --extra asr python test/_live_failure_survival.py
 **只做 B 站。** 其他站点未测。
 
 **扫码超时默认 180 秒。** 超时后报「没检测到登录」，浏览器窗口会被关掉。重新跑一次即可。
+
+**CLI 管道输出是控制台代码页，不是 UTF-8。** 实测 `probe` 的 stdout 存成管道是 1677 字节，UTF-8 解不开，cp936 解出 1333 字符。非中文 locale 的调用方读文本会拿到替换字符，可行的用法是不解析文本、只看退出码。这是权衡后的取舍，`sys.stdout` 不重设编码，因为 `_run` 让平台决定子进程编码是有意的。要真正修得两侧一起钉成 UTF-8，与本页第一条限制是同一件事。
+
+**跳过判据的密度下限只有一门课的样本。** `_MIN_CHARS_PER_SEC = 3.0` 来自 `BV1Y5QgB5Eas` 的 30 份真实产物，实测区间是每秒 4.239 到 5.418 字符，下限比最低值低 1.41 倍。换一门语速更慢的课，真实下界可能下移，余量未必够。失败形态是已完成的讲次被重跑，代价是几分钟，不丢数据。若换课跑出误判，用那份产物重标。
+
+**`probe` 的 JSON 解析只守了一半。** `_requested_track` 与 `_fetch_targets` 都接住 `ValueError`，`probe` 里那次 `json.loads` 没接，所以坏 JSON 会以裸 `JSONDecodeError` 冒出来。本轮未改。
+
+**两处接口设计有已知的松动，未改。** `PartTranscript` 的 `status` 与 `failure_reason` 是两个独立字段，所以「`status = ok` 却带原因」与「`status = failed` 却不带原因」都能构造出来，`_retry_word` 正是在兜后者。另外 `Video.formats` 把 yt-dlp 的原始 JSON 直接带进领域类型，格式化输出时再伸手取键。两条都是 review 指出、本轮未动的取舍。
+
+**`transcripts` 把未知异常一律记成 `asr_error`。** 好处是一讲失败不拖累整批。代价是本模块自己的编程缺陷也会被记成「可重试」的瞬时故障，汇总行因此会说可以重跑。
 
 ## 依赖
 
