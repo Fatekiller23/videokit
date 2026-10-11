@@ -184,6 +184,24 @@ videokit.reuse_or_login()    # 已有凭据就复用，没有才拉起浏览器
 
 命令行入口目前只有 `login` 一个子命令。探测、下载、转写三块能力的命令行是 #20 的范围；这里单独有一个入口，是因为扫码这件事得能在不 import 本模块的前提下跑起来。
 
+### 登录态失效时被识别出来
+
+`probe` 在没拿到字幕轨、且 yt-dlp 报出登录告警时抛 `LoginRequired`，而不是返回一份每讲都空的 `Video`。提示指向 `videokit.py login`，不贴 yt-dlp 的原始告警。
+
+判定用两个信号，缺一不可。
+
+- 整条视频里有任何一讲返回真实字幕轨，登录态就算有效。
+- 一讲都没有，**且** stderr 出现 `Subtitles are only available when logged in`，判为登录态缺失。
+- 一讲都没有，**且**没有该告警，判为该视频确实没有字幕，正常返回。
+
+**不能只看「字幕轨为空」。** 实测有效凭据下 `BV1Y5QgB5Eas` 的 p1 本就无字幕，返回的表同样是空的，与未登录的表现逐字节同形。那行告警是唯一能区分两者的信号。同理，**退出码完全无用**，六种实测输入退出码全是 0。
+
+**也不断言是「过期」。** 「过期」与「从未登录」在外部表现上完全一致，文案统一说需要登录并给出入口，不猜原因。
+
+告警走 stderr 而退出码是 0，所以 `_run` 返回 `RunOutput(stdout, stderr)` 两个流，不再只返回 stdout。
+
+`part_subtitles` 用同一条判定。取不到轨道且出现告警时抛 `LoginRequired`，否则才抛 `SubtitleUnavailable`。两者都在 stdout 上没有内容，但补救动作相反，一个去重新登录，一个转语音识别。
+
 ### 为什么必须走 CDP 导出
 
 程序无法直接读浏览器的 Cookie 库。本机实测四种方式全部失败，记录在 `docs/research/measured-bilibili-subtitle-availability.md`。
@@ -268,7 +286,7 @@ RecognisedUnit
 
 `videokit.py` 是全部实现。分三层。
 
-**`_run` 是唯一的网络边界。** 所有 `yt-dlp` 调用都从这里出去。**模型是第二个边界，在 `transcribe` 的 `engine=` 参数上。** 其余全是纯函数。
+**`_run` 是唯一的网络边界。** 所有 `yt-dlp` 调用都从这里出去。它返回 `RunOutput(stdout, stderr)` 两个流，因为登录告警写在 stderr 而退出码是 0。**模型是第二个边界，在 `transcribe` 的 `engine=` 参数上。** 其余全是纯函数。
 
 **`probe` 用两次 `yt-dlp` 调用，这是 B 站提取器的现状，不是设计偏好。**
 
@@ -309,7 +327,7 @@ RecognisedUnit
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-74 项断言，约 3.6 秒，不联网、不需要登录态。
+88 项断言，约 3.7 秒，不联网、不需要登录态。
 
 语音识别那一层另有 31 项断言，合计 105 项、约 4 秒，同样不需要 funasr、不需要 GPU、不联网。
 
@@ -330,9 +348,13 @@ CDP 那一层替换的是 WebSocket 对象。`cdp_cookies(ws)` 收一个已连�
 - `cdp-cookies.json`：真实 Chrome 的 `Network.getAllCookies` 回包，36 条，Cookie 值已抹掉，其余字段是浏览器原样报的。
 - `cdp-targets.json`：真实 `/json/list` 回包，含非 page target 与另一个站点的 page，所以「选了第一个」和「选对了」能区分开。
 - `netscape-reference.txt`：**这份期望值由 `yt-dlp` 自己的 Cookie 导出器写出**，是对同一次会话的独立结果。序列化测试断言逐字节相同，这样期望值不是把实现重算一遍。
+- `list-subs-logged-out.txt` 与 `list-subs-login-warning.txt`：同一次无凭据运行的两个流，空字幕表与那行告警分别落成两个夹具，因为告警在 stderr 而表在 stdout。
+- `list-subs-valid-no-subs.txt`：有效凭据下一讲本就无字幕的运行。它与上面那份空表结构同形，是用来证明「空表不等于未登录」的对照件。
 - `subtitles-p12-slice.srt`、`subtitles-p18-slice.srt`：真字幕轨的连续切片，按行区间裁，保留末尾空行，所以 `4N+1` 成立。
 - `subtitle-print-part.txt`、`subtitle-print-no-track.txt`：真实的一次 `--print "%(requested_subtitles)j"` 回包，有轨与无轨各一份。无轨那份只有 3 字节，内容是 `NA`。
 - `asr-23.txt`、`asr-23.timestamp.json`：**一次真实 ASR 运行的原始产物**，3160.2 秒音频，17123 字符文本配 15908 对毫秒，逐字节 sha256 与实测记录一致。两者的长度不等正是配对规则要解释的事实，所以这份夹具不能被手工构造的样本替代。
+
+登录信号那三份由 `test/_record_login_signals.py` 重新录制，改站或换 yt-dlp 后要重跑一次。
 
 `LoginError` 的四种失败路径都有断言，且都用 `timeout_sec=0` 走完，所以测试不会真的等一个扫码超时。
 

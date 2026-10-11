@@ -1,0 +1,19 @@
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Downloading playlist BV1Y5QgB5Eas - add --no-playlist to download just the video BV1Y5QgB5Eas
+[download] Downloading playlist: 【徐高2025年宏观课】中国宏观经济
+[BiliBili] Playlist 【徐高2025年宏观课】中国宏观经济: Downloading 1 items
+[download] Downloading item 1 of 1
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=3
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] BV1Y5QgB5Eas: Downloading wbi sign
+[BiliBili] BV1Y5QgB5Eas: Downloading video formats for cid 37495637061
+[BiliBili] Format(s) 1080P 高码率 are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495637061
+[info] Available subtitles for BV1Y5QgB5Eas_p3:
+Language Formats
+danmaku  xml
+[download] Finished downloading playlist: 【徐高2025年宏观课】中国宏观经济
