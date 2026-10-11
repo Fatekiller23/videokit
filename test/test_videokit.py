@@ -29,6 +29,13 @@ MULTI_SUBS = (FIXTURES / "list-subs-multipart.txt").read_text(encoding="utf-8")
 SINGLE_SUBS = (FIXTURES / "list-subs-single.txt").read_text(encoding="utf-8")
 MULTI_DUMP = (FIXTURES / "dump-multipart.json").read_text(encoding="utf-8")
 
+# The six inputs recon.md measured, recorded as two streams. These three are
+# the ones that separate the three cases: a logged-out run, a valid login on a
+# part with no subtitles, and a valid login on a part that has one.
+LOGGED_OUT_SUBS = (FIXTURES / "list-subs-logged-out.txt").read_text(encoding="utf-8")
+VALID_NO_SUBS = (FIXTURES / "list-subs-valid-no-subs.txt").read_text(encoding="utf-8")
+LOGIN_WARNING = (FIXTURES / "list-subs-login-warning.txt").read_text(encoding="utf-8")
+
 # A real `Network.getAllCookies` response, recorded from a logged-in Chrome.
 # Cookie values are redacted; every other field is what the browser reported.
 CDP_COOKIES = json.loads(
@@ -117,8 +124,8 @@ class Probe(unittest.TestCase):
         def fake_run(args, cookies):
             self.calls.append(args)
             if "--dump-single-json" in args:
-                return MULTI_DUMP
-            return MULTI_SUBS
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(MULTI_SUBS, "")
 
         videokit._run = fake_run
 
@@ -178,7 +185,7 @@ class Download(unittest.TestCase):
             self.calls.append(args)
             # yt-dlp reports the paths it wrote; the module must return those
             # rather than guessing a filename from the output template.
-            return "/out/16.wav\n"
+            return videokit.RunOutput("/out/16.wav\n", "")
 
         videokit._run = fake_run
         self.out = Path(__file__).resolve().parent / "_tmp_out"
@@ -289,6 +296,152 @@ class ErrorHandling(unittest.TestCase):
             self.assertIn("could not execute", str(ctx.exception))
         finally:
             sp.run = original
+
+
+class RunBoundary(unittest.TestCase):
+    """What `_run` hands back, given what the subprocess actually produced."""
+
+    def _fake_subprocess(self, stdout: str, stderr: str, returncode: int = 0):
+        import subprocess as sp
+
+        original = sp.run
+
+        def fake_run(cmd, **kwargs):
+            class R:
+                pass
+
+            R.returncode = returncode
+            R.stdout = stdout
+            R.stderr = stderr
+            return R()
+
+        sp.run = fake_run
+        self.addCleanup(setattr, sp, "run", original)
+
+    def test_stderr_survives_a_successful_run(self):
+        # The login warning is written to stderr while the exit code stays 0.
+        # A boundary that hands back stdout alone loses the only signal that
+        # separates "logged out" from "this video has no subtitles".
+        self._fake_subprocess("", "WARNING: no login\n")
+        result = videokit._run(["--list-subs"], None)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "WARNING: no login\n")
+
+    def test_both_streams_survive_a_successful_run(self):
+        self._fake_subprocess("[info] Available subtitles for BV1x_p1:\n", "WARNING: x\n")
+        result = videokit._run(["--list-subs"], None)
+        self.assertIn("BV1x_p1", result.stdout)
+        self.assertIn("WARNING: x", result.stderr)
+
+
+class LoginSignal(unittest.TestCase):
+    """Which of the three inputs this is, judged from one --list-subs run.
+
+    The ticket says to judge by whether real subtitle tracks come back, and not
+    by the exit code. That alone cannot work: recon.md measured that a valid
+    login on a part with no subtitles returns an empty table with exit 0, the
+    same as a logged-out run. The warning yt-dlp prints to stderr is the only
+    signal that separates those two.
+    """
+
+    def test_an_empty_table_with_the_warning_is_a_login_problem(self):
+        subs = videokit.parse_subtitle_table(LOGGED_OUT_SUBS)
+        self.assertTrue(videokit.login_needed(subs, LOGIN_WARNING))
+
+    def test_an_empty_table_without_the_warning_is_a_video_without_subtitles(self):
+        # p1 of the classroom course genuinely has no subtitles. A valid login
+        # returns an empty table for it too, and must not be called a failure.
+        subs = videokit.parse_subtitle_table(VALID_NO_SUBS)
+        self.assertFalse(videokit.login_needed(subs, ""))
+
+    def test_a_real_track_wins_over_the_warning(self):
+        # Judged across the whole video: one part with a real track proves the
+        # credentials work, whatever stderr says.
+        subs = videokit.parse_subtitle_table(MULTI_SUBS)
+        self.assertFalse(videokit.login_needed(subs, LOGIN_WARNING))
+
+    def test_one_real_part_among_many_empty_ones_is_still_a_valid_login(self):
+        subs = {
+            "BV1x_p1": (),
+            "BV1x_p2": (),
+            "BV1x_p3": ("ai-zh",),
+            "BV1x_p4": (),
+        }
+        self.assertFalse(videokit.login_needed(subs, LOGIN_WARNING))
+
+    def test_no_parts_at_all_with_the_warning_is_a_login_problem(self):
+        # A URL that resolves to nothing still means the run got nowhere.
+        self.assertTrue(videokit.login_needed({}, LOGIN_WARNING))
+
+
+class LoginRequiredMessage(unittest.TestCase):
+    """What the user is handed instead of a silently empty transcript.
+
+    Measured constraint: expired and never-logged-in are externally identical,
+    so the message must not claim a cause. It names what to do instead.
+    """
+
+    def setUp(self):
+        self.original = videokit._run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+
+    def _logged_out(self):
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(LOGGED_OUT_SUBS, LOGIN_WARNING)
+
+        videokit._run = fake_run
+
+    def test_probe_refuses_rather_than_reporting_an_empty_transcript(self):
+        self._logged_out()
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+        self.assertIn("login", str(ctx.exception).lower())
+
+    def test_the_message_names_the_re_login_entry_point(self):
+        self._logged_out()
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.probe("u")
+        self.assertIn("videokit.py login", str(ctx.exception))
+
+    def test_the_message_does_not_claim_the_login_expired(self):
+        # Expired and never-logged-in produce identical output, so naming a
+        # cause would be a guess dressed as a finding.
+        self._logged_out()
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.probe("u")
+        self.assertNotIn("expired", str(ctx.exception).lower())
+
+    def test_the_message_does_not_paste_the_raw_yt_dlp_warning(self):
+        self._logged_out()
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.probe("u")
+        self.assertNotIn("WARNING: [BiliBili]", str(ctx.exception))
+
+    def test_a_valid_login_that_finds_no_subtitles_is_not_a_login_problem(self):
+        # Same empty table, no warning. This video simply has no subtitles, so
+        # it must come back as an ordinary Video rather than as an error.
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(VALID_NO_SUBS, "")
+
+        videokit._run = fake_run
+        video = videokit.probe("u")
+        self.assertEqual(len(video.parts), 30)
+
+    def test_the_zero_signal_still_holds_for_a_real_course(self):
+        # 21 of the 30 parts have subtitles, so a valid login is judged valid
+        # even though 9 parts come back empty.
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(MULTI_SUBS, "")
+
+        videokit._run = fake_run
+        video = videokit.probe("u")
+        self.assertEqual(sum(1 for p in video.parts if p.has_subtitles), 21)
 
 
 class NetscapeSerialization(unittest.TestCase):
@@ -828,7 +981,7 @@ class SubtitleRetrieval(unittest.TestCase):
 
         def fake_run(args, cookies):
             self.calls.append(args)
-            return SUB_PRINT_PART
+            return videokit.RunOutput(SUB_PRINT_PART, "")
 
         videokit._run = fake_run
         self.addCleanup(setattr, videokit, "_run", self.original)
@@ -866,16 +1019,19 @@ class SubtitleRetrieval(unittest.TestCase):
         # track must be read back, not rejected because it is not `ai-zh`.
         def other_language(args, cookies):
             self.calls.append(args)
-            return json.dumps(
-                {
-                    "zh-CN": {
-                        "ext": "srt",
-                        "data": (
-                            "1\n00:00:01,000 --> 00:00:02,500\n人工字幕\n\n"
-                            "2\n00:00:02,500 --> 00:00:04,000\n第二行\n\n"
-                        ),
+            return videokit.RunOutput(
+                json.dumps(
+                    {
+                        "zh-CN": {
+                            "ext": "srt",
+                            "data": (
+                                "1\n00:00:01,000 --> 00:00:02,500\n人工字幕\n\n"
+                                "2\n00:00:02,500 --> 00:00:04,000\n第二行\n\n"
+                            ),
+                        }
                     }
-                }
+                ),
+                "",
             )
 
         videokit._run = other_language
@@ -889,7 +1045,7 @@ class SubtitleRetrieval(unittest.TestCase):
         # empty list" would write an empty transcript and never notice.
         def no_track(args, cookies):
             self.calls.append(args)
-            return SUB_PRINT_NO_TRACK
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
 
         videokit._run = no_track
         with self.assertRaises(videokit.SubtitleUnavailable) as ctx:
@@ -900,7 +1056,7 @@ class SubtitleRetrieval(unittest.TestCase):
         # Same part, same call shape. One outcome raises, the other returns a
         # list. Asserting both here keeps them from being conflated later.
         def no_track(args, cookies):
-            return SUB_PRINT_NO_TRACK
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
 
         videokit._run = no_track
         raised = False
@@ -915,7 +1071,9 @@ class SubtitleRetrieval(unittest.TestCase):
         # A payload carrying an empty track is not a transcript. Returning []
         # here would put an empty transcript into the pipeline.
         def empty_track(args, cookies):
-            return json.dumps({"ai-zh": {"ext": "srt", "data": ""}})
+            return videokit.RunOutput(
+                json.dumps({"ai-zh": {"ext": "srt", "data": ""}}), ""
+            )
 
         videokit._run = empty_track
         with self.assertRaises(videokit.SubtitleUnavailable):
@@ -925,11 +1083,27 @@ class SubtitleRetrieval(unittest.TestCase):
         # A danmaku-only payload carries no transcribable track, so it means
         # the same thing as no track at all.
         def danmaku_only(args, cookies):
-            return json.dumps({"danmaku": {"ext": "xml", "url": "https://x"}})
+            return videokit.RunOutput(
+                json.dumps({"danmaku": {"ext": "xml", "url": "https://x"}}), ""
+            )
 
         videokit._run = danmaku_only
         with self.assertRaises(videokit.SubtitleUnavailable):
             videokit.part_subtitles("u", 12)
+
+    def test_a_logged_out_run_is_not_reported_as_a_missing_track(self):
+        # Both outcomes look like "no payload" on stdout. With the login
+        # warning on stderr this is the credential's fault, not the part's, and
+        # the two send the caller to different remedies: one re-logs in, the
+        # other queues speech recognition.
+        def logged_out(args, cookies):
+            self.calls.append(args)
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, LOGIN_WARNING)
+
+        videokit._run = logged_out
+        with self.assertRaises(videokit.LoginRequired) as ctx:
+            videokit.part_subtitles("u", 3)
+        self.assertIn("videokit.py login", str(ctx.exception))
 
     def test_the_track_data_is_not_read_from_the_filesystem(self):
         # The fixture is a payload, not a directory. A retrieval path that
@@ -951,18 +1125,17 @@ def segment(text: str) -> videokit.Segment:
     return videokit.Segment(start_sec=0.0, end_sec=1.0, text=text)
 
 
-def stub_run(payload: str):
-    """A stubbed `_run` result, in the shape the installed module expects.
+def stub_run(payload: str, stderr: str = ""):
+    """A stubbed `_run` result carrying one recorded payload.
 
-    Ticket #13 changes this seam's return type from `str` to `RunOutput`, which
-    carries stderr as well because yt-dlp writes its login warning there and
-    exits 0. The two tickets land separately, so this adapts to whichever shape
-    it finds and the stub keeps working across the merge.
+    `_run` returns both streams, because yt-dlp writes its login warning to
+    stderr and still exits 0, so a stub returning a bare string would hide the
+    signal that tells "not logged in" apart from "this video has no
+    subtitles". The subtitle payloads were recorded with a working login and
+    carry no warning, so stderr defaults to empty and only the login tests
+    pass one.
     """
-    output = getattr(videokit, "RunOutput", None)
-    if output is None:
-        return payload
-    return output(stdout=payload, stderr="")
+    return videokit.RunOutput(stdout=payload, stderr=stderr)
 
 
 class TranscriptText(unittest.TestCase):
@@ -1065,6 +1238,8 @@ class PartJudgment(unittest.TestCase):
     def setUp(self):
         self.calls: list[list[str]] = []
         self.original = videokit._run
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
 
         def fake_run(args, cookies):
             self.calls.append(args)
@@ -1080,6 +1255,11 @@ class PartJudgment(unittest.TestCase):
         videokit._run = fake_run
         self.addCleanup(setattr, videokit, "_run", self.original)
         self.video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
 
     def _part(self, index: int) -> videokit.Part:
         return next(p for p in self.video.parts if p.index == index)
@@ -1141,20 +1321,36 @@ class PartJudgment(unittest.TestCase):
         self.assertEqual(record.status, "pending")
         self.assertIsNone(record.source)
 
-    @unittest.skipUnless(
-        hasattr(videokit, "LoginRequired"),
-        "ticket #13 adds LoginRequired; this assertion starts biting once it lands",
-    )
     def test_a_credential_problem_is_not_recorded_as_a_part_without_a_track(self):
-        # These two look alike from here and are opposite in remedy. A part
-        # with no track waits for ASR, which will always work. A stale login
-        # makes every part look empty, and running ASR over the whole course
-        # would be the wrong response to a credential that needs re-exporting.
-        def stale_login(args, cookies):
+        # The two look alike from inside this method and are opposite in
+        # remedy. A part with no track waits for ASR, which will always work.
+        # A stale login makes every part read as trackless, so recording that
+        # as `pending` would hand the whole 30-part course to the ASR path in
+        # response to a problem that re-exporting the credential fixes.
+        # `probe` is what sees the warning first, and it refuses there.
+        def logged_out(args, cookies):
             self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            return stub_run(LOGGED_OUT_SUBS, LOGIN_WARNING)
+
+        videokit._run = logged_out
+        with self.assertRaises(videokit.LoginRequired):
+            videokit.transcripts("u", self.tmp / "transcripts")
+
+    def test_a_stale_login_reaches_the_batch_from_the_fetch_too(self):
+        # The probe table says part 12 has a track and the fetch disagrees
+        # because the login went stale between the two calls. That is not a
+        # part needing ASR either, so it must not be written as `pending`.
+        def stale_on_fetch(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
             raise videokit.LoginRequired("login required")
 
-        videokit._run = stale_login
+        videokit._run = stale_on_fetch
         with self.assertRaises(videokit.LoginRequired):
             videokit.part_transcript(self.video, self._part(12))
 
