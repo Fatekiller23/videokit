@@ -937,5 +937,341 @@ class SubtitleRetrieval(unittest.TestCase):
         self.assertTrue(all(isinstance(s, videokit.Segment) for s in segments))
 
 
+# Raw output of one real ASR run, saved verbatim from the engine. This is the
+# only ASR material that is not a hand-written sample: 3160.2 seconds of real
+# audio produced 17123 characters of text beside 15908 millisecond pairs, and
+# the two counts differ, which is the fact the pairing rule has to explain.
+#   asr-23.txt              sha256 d1f57fbeee2c9bdb0cafa79bdfb7da6497458e52da476e761e3227e22d2c5a7c
+#   asr-23.timestamp.json   sha256 55933e229414f4b40976ac399292e4d574b3e65f4099709bd9a77f79c2a272da
+ASR_TEXT = (FIXTURES / "asr-23.txt").read_text(encoding="utf-8")
+ASR_TIMESTAMPS = json.loads(
+    (FIXTURES / "asr-23.timestamp.json").read_text(encoding="utf-8")
+)
+
+# The catalogued totals for that run, measured and recorded in the ASR study.
+# Written as literals so a regression in any of them fails a test instead of
+# silently changing the segmentation.
+ASR_CHARS = 17123
+ASR_UNITS = 15908
+ASR_SEGMENTS = 1152
+
+
+class _Device:
+    """The two fields the module may read off a torch device."""
+
+    def __init__(self, type_: str, index: int | None = None):
+        self.type = type_
+        self.index = index
+
+    def __str__(self) -> str:
+        return self.type if self.index is None else f"{self.type}:{self.index}"
+
+
+class _Parameter:
+    def __init__(self, device: _Device):
+        self.device = device
+
+
+class _SubModel:
+    """Stands in for a torch module, which yields parameters."""
+
+    def __init__(self, device: _Device):
+        self._device = device
+
+    def parameters(self):
+        return iter([_Parameter(self._device)])
+
+
+class _Engine:
+    """An AutoModel-shaped object. Fakes the two attributes the module reads."""
+
+    def __init__(self, result: dict, device: _Device = None):
+        self._result = result
+        self.model = _SubModel(device or _Device("cpu"))
+        self.calls: list[dict] = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        return [self._result]
+
+
+class AsrSegmentation(unittest.TestCase):
+    """Pairing timestamps with text, on the real recorded output.
+
+    The model is absent here by construction. Every assertion below reads the
+    saved artifacts of a run that already happened, so the suite needs neither
+    a GPU nor a network, and it still asserts against bytes the engine really
+    produced rather than against a hand-written sample.
+    """
+
+    def test_one_timestamp_per_recognised_unit(self):
+        # The count that makes the pairing possible. A Han character or one
+        # whole run of ASCII alphanumerics spends one pair; punctuation and
+        # whitespace spend none. 15883 characters plus 25 ASCII runs is 15908.
+        units = videokit.recognised_units(ASR_TEXT)
+        self.assertEqual(len(units), ASR_UNITS)
+        self.assertEqual(len(ASR_TIMESTAMPS), ASR_UNITS)
+        self.assertNotEqual(len(ASR_TEXT), ASR_UNITS)
+
+    def test_an_ascii_run_spends_one_pair_not_one_per_letter(self):
+        # `GDP` is 23 occurrences in this run and each spends a single pair.
+        # Pairing per character instead would overrun by 61 units.
+        units = videokit.recognised_units("我们把GDP这个讲完了")
+        self.assertEqual([u.text for u in units], ["我", "们", "把", "GDP", "这", "个", "讲", "完", "了"])
+
+    def test_produces_the_measured_segment_count(self):
+        self.assertEqual(len(videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)), ASR_SEGMENTS)
+
+    def test_first_segment_is_the_recorded_opening(self):
+        segment = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)[0]
+        self.assertEqual(segment, videokit.Segment(0.11, 0.25, "呃，"))
+
+    def test_last_segment_is_the_recorded_ending(self):
+        segment = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)[-1]
+        self.assertEqual(
+            segment,
+            videokit.Segment(3154.9, 3157.945, "就会导致你内需不足的问题长期存在。"),
+        )
+
+    def test_seconds_are_whole_milliseconds_over_a_thousand(self):
+        # No rounding is applied. 110 ms is 0.11 s exactly, and the last
+        # segment's end is 3157945 ms.
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        self.assertEqual(segments[0].start_sec, 110 / 1000)
+        self.assertEqual(segments[-1].end_sec, 3157945 / 1000)
+
+    def test_the_segment_texts_rebuild_the_raw_output(self):
+        # Nothing is dropped, nothing is invented. Punctuation stays on the
+        # segment it closes.
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        self.assertEqual("".join(s.text for s in segments), ASR_TEXT)
+
+    def test_every_segment_closes_on_punctuation(self):
+        # The cut points are exactly where the engine put a mark, which is why
+        # ct-punc is a requirement rather than a refinement.
+        marks = set("，。？！、；：,.;:!?")
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        self.assertTrue(all(s.text[-1] in marks for s in segments))
+
+    def test_the_western_marks_are_cut_points_too(self):
+        # ct-punc writes `.` and `,` after ASCII words. Measured on this run:
+        # 3 full stops and 1 comma. Leaving them out yields 1148 segments
+        # instead of 1152, which is how that mistake was found.
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        western = [s for s in segments if s.text[-1] in ".,"]
+        self.assertEqual(len(western), 4)
+        self.assertEqual(
+            western[0],
+            videokit.Segment(1412.62, 1413.48, "我们加入了WTO."),
+        )
+
+    def test_no_segment_is_empty_or_overlaps_the_next(self):
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        self.assertEqual([s for s in segments if not s.text.strip()], [])
+        self.assertEqual([s for s in segments if s.end_sec < s.start_sec], [])
+        for earlier, later in zip(segments, segments[1:]):
+            self.assertLessEqual(earlier.end_sec, later.start_sec)
+
+    def test_a_segment_always_carries_at_least_one_recognised_unit(self):
+        # A segment holding punctuation alone would be an artifact of the cut
+        # rule rather than something the engine said, so there are none.
+        segments = videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)
+        self.assertEqual(
+            [s for s in segments if not videokit.recognised_units(s.text)], []
+        )
+
+    def test_the_filler_words_are_kept_because_that_is_the_decision(self):
+        # Colloquial fillers survive on purpose. This is not a recognition
+        # defect and this module does not clean them up.
+        text = "".join(s.text for s in videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS))
+        self.assertEqual(text.count("啊"), 277)
+        self.assertEqual(text.count("这个"), 424)
+        self.assertEqual(text.count("就是"), 60)
+
+    def test_a_count_mismatch_is_refused_rather_than_guessed(self):
+        # If the two sides disagree, any pairing is a guess. Stopping here is
+        # what keeps a silent misalignment out of a transcript.
+        with self.assertRaises(videokit.AsrError) as ctx:
+            videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS[:-1])
+        self.assertIn(str(ASR_UNITS), str(ctx.exception))
+
+    def test_a_trailing_run_without_a_mark_is_still_a_segment(self):
+        text = "呃，我们把GDP这个讲完了"
+        pairs = [[110, 250]] + [[250 + 60 * i, 310 + 60 * i] for i in range(9)]
+        segments = videokit.asr_segments(text, pairs)
+        self.assertEqual(segments[0], videokit.Segment(0.11, 0.25, "呃，"))
+        self.assertEqual(segments[1].text, "我们把GDP这个讲完了")
+        self.assertEqual(segments[1].start_sec, 0.25)
+        self.assertEqual(segments[1].end_sec, pairs[-1][1] / 1000)
+
+    def test_recognised_units_report_where_they_sit_in_the_text(self):
+        # The offsets are what the cut rule indexes by, so they are contract,
+        # not an internal detail.
+        units = videokit.recognised_units("呃，GDP。")
+        self.assertEqual(
+            [(u.start, u.end, u.text) for u in units],
+            [(0, 1, "呃"), (2, 5, "GDP")],
+        )
+
+
+class AsrDevice(unittest.TestCase):
+    """Where the model actually runs, read rather than assumed.
+
+    FunASR accepts `device="cuda:0"` on a machine with no CUDA and quietly
+    runs on the CPU. Every assertion here exists because a wrong device is
+    invisible from the outside: the transcript looks the same either way.
+    """
+
+    def test_reads_the_device_off_the_models_parameters(self):
+        engine = _Engine({}, _Device("cuda", 0))
+        self.assertEqual(videokit.detect_device(engine), "cuda:0")
+
+    def test_a_cuda_request_honoured_is_accepted(self):
+        engine = _Engine({}, _Device("cuda", 0))
+        self.assertEqual(videokit.verify_device(engine, "cuda:0"), "cuda:0")
+
+    def test_a_cuda_request_quietly_downgraded_is_reported(self):
+        # The measured failure. The engine returns a perfectly good result, so
+        # the only place this can be caught is here.
+        engine = _Engine({}, _Device("cpu"))
+        with self.assertRaises(videokit.AsrError) as ctx:
+            videokit.verify_device(engine, "cuda:0")
+        self.assertIn("cuda:0", str(ctx.exception))
+        self.assertIn("cpu", str(ctx.exception))
+
+    def test_a_cpu_request_is_the_honest_path_on_this_machine(self):
+        engine = _Engine({}, _Device("cpu"))
+        self.assertEqual(videokit.verify_device(engine, "cpu"), "cpu")
+
+    def test_the_misleading_attribute_is_not_consulted(self):
+        # `model.model.device` reads back None even when the model is on the
+        # CPU, so consulting it would report "unknown" instead of the truth.
+        engine = _Engine({}, _Device("cpu"))
+        engine.model.device = None
+        self.assertEqual(videokit.detect_device(engine), "cpu")
+
+    def test_an_engine_without_parameters_is_reported_not_ignored(self):
+        class Bare:
+            pass
+
+        with self.assertRaises(videokit.AsrError) as ctx:
+            videokit.detect_device(Bare())
+        self.assertIn("parameters", str(ctx.exception))
+
+    def test_the_engine_configuration_names_all_three_models(self):
+        # ct-punc is required, not optional. Without it the output is
+        # characters separated by spaces with no punctuation at all, and there
+        # are no cut points to segment on.
+        kwargs = videokit.engine_kwargs("cpu")
+        self.assertEqual(kwargs["model"], "paraformer-zh")
+        self.assertEqual(kwargs["vad_model"], "fsmn-vad")
+        self.assertEqual(kwargs["punc_model"], "ct-punc")
+        self.assertEqual(kwargs["device"], "cpu")
+        self.assertIs(kwargs["disable_update"], True)
+
+    def test_the_engine_configuration_carries_the_requested_device(self):
+        self.assertEqual(videokit.engine_kwargs("cuda:1")["device"], "cuda:1")
+
+
+class AsrTranscription(unittest.TestCase):
+    """One call in, segments out, with the model stubbed.
+
+    The engine is the slow part and it cannot be in a unit test. It is reached
+    through one argument, so the logic around it is exercised here while the
+    real engine is exercised by the live script.
+    """
+
+    def test_returns_segments_built_from_the_engine_result(self):
+        engine = _Engine({"text": "呃，我们把GDP这个讲完了。", "timestamp": [
+            [110, 250], [250, 350], [350, 430], [430, 500], [500, 600],
+            [600, 700], [700, 800], [800, 900], [900, 1000], [1000, 1100],
+        ]})
+        segments = videokit.transcribe(Path("06.wav"), engine=engine)
+        self.assertEqual(
+            segments,
+            [
+                videokit.Segment(0.11, 0.25, "呃，"),
+                videokit.Segment(0.25, 1.1, "我们把GDP这个讲完了。"),
+            ],
+        )
+
+    def test_asks_the_engine_for_the_audio_file(self):
+        engine = _Engine({"text": "呃，", "timestamp": [[110, 250]]})
+        videokit.transcribe(Path("D:/audio/06.wav"), engine=engine)
+        self.assertEqual(engine.calls[0]["input"], str(Path("D:/audio/06.wav")))
+
+    def test_the_buggy_sentence_info_is_not_used(self):
+        # FunASR 1.4.16 groups sentences against the wrong text on long audio;
+        # the saved full-length run drifts from the top-level text at character
+        # 318. The result carries the key here on purpose, and the output must
+        # not move.
+        engine = _Engine({
+            "text": "呃，我们把GDP这个讲完了。",
+            "timestamp": [
+                [110, 250], [250, 350], [350, 430], [430, 500], [500, 600],
+                [600, 700], [700, 800], [800, 900], [900, 1000], [1000, 1100],
+            ],
+            "sentence_info": [{"text": "wrong", "start": 0, "end": 5}],
+        })
+        segments = videokit.transcribe(Path("06.wav"), engine=engine)
+        self.assertEqual([s.text for s in segments], ["呃，", "我们把GDP这个讲完了。"])
+
+    def test_a_result_with_no_timestamps_is_refused(self):
+        engine = _Engine({"text": "呃，", "timestamp": []})
+        with self.assertRaises(videokit.AsrError):
+            videokit.transcribe(Path("06.wav"), engine=engine)
+
+    def test_the_requested_device_is_checked_before_any_audio_is_read(self):
+        engine = _Engine({"text": "呃，", "timestamp": [[110, 250]]}, _Device("cpu"))
+        with self.assertRaises(videokit.AsrError):
+            videokit.transcribe(Path("06.wav"), engine=engine, device="cuda:0")
+        self.assertEqual(engine.calls, [])
+
+
+class AsrDependencies(unittest.TestCase):
+    """What has to be installed, and what the user is told when it is not.
+
+    These tests run on a machine without funasr, which is the point: the suite
+    must not depend on the ASR stack to describe its absence.
+    """
+
+    def test_a_missing_funasr_names_the_three_packages(self):
+        import sys as _sys
+
+        saved = _sys.modules.get("funasr")
+        _sys.modules["funasr"] = None
+        try:
+            with self.assertRaises(videokit.TranscriptionUnavailable) as ctx:
+                videokit.load_engine()
+        finally:
+            if saved is None:
+                _sys.modules.pop("funasr", None)
+            else:
+                _sys.modules["funasr"] = saved
+        message = str(ctx.exception)
+        self.assertIn("funasr", message)
+        self.assertIn("torch", message)
+        # Without a fbank backend, feature extraction raises at run time
+        # rather than at import time, so the message has to name it too.
+        self.assertIn("kaldi-native-fbank", message)
+
+    def test_the_three_asr_dependencies_are_declared(self):
+        # Recorded in the package metadata, because a machine that installs
+        # this package otherwise fails at feature extraction.
+        manifest = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        for package in ("funasr", "torch", "kaldi-native-fbank"):
+            self.assertIn(package, manifest)
+
+    def test_the_filler_word_decision_is_written_down(self):
+        # The ticket asks for this in the README, and a decision that is only
+        # in a commit message gets reverted by the next person.
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("填充词", readme)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

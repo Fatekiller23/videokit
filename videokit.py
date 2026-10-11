@@ -4,6 +4,7 @@ Entry points, one per input shape:
 
     probe(url)                  -> Video            what exists at this URL
     part_subtitles(url, part)   -> list[Segment]    that part's subtitle track
+    transcribe(wav)             -> list[Segment]    that part's audio as speech
     download_video(...)         -> list[Path]       the video files
     download_audio(...)         -> list[Path]       the audio files, for ASR
 
@@ -819,6 +820,275 @@ def download_audio(
             "--postprocessor-args", "-ar 16000 -ac 1",
         ],
     )
+
+
+class AsrError(VideoKitError):
+    """Raised when speech recognition cannot produce a trustworthy transcript.
+
+    Covers both a missing engine and a result this module refuses to pair. The
+    second case matters more: a mismatched result is not a crash to retry, it
+    is a transcript that would be silently wrong if it were returned.
+    """
+
+
+class TranscriptionUnavailable(AsrError):
+    """Raised when the ASR stack is not installed on this machine.
+
+    Separate from the other failures because the caller's response is a
+    different one. Nothing about the audio or the network is wrong here, so
+    retrying is pointless and the fix is an install.
+    """
+
+
+# The three names in the message below are all required, and the third is the
+# one that is easy to miss. funasr and torch alone install cleanly and load a
+# model successfully, then raise ImportError the moment audio is fed in.
+# Measured on this machine, funasr's own message for that case names both
+# backends:
+#
+#   ImportError: torchaudio is not installed and neither is the
+#   kaldi-native-fbank fallback backend.
+#
+# Either backend satisfies it. This package takes kaldi-native-fbank because it
+# does not pin a torch version the way torchaudio does.
+_MISSING_DEPS = (
+    "the ASR stack is not installed. Transcription needs three packages, "
+    "declared as this package's `asr` extra:\n"
+    "    uv sync --extra asr\n"
+    "funasr is the engine, torch is its tensor backend, and "
+    "kaldi-native-fbank extracts the features. All three are requirements. "
+    "Without the third, funasr loads a model and then raises ImportError when "
+    "the first audio arrives."
+)
+
+
+@dataclass(frozen=True)
+class RecognisedUnit:
+    """One thing the engine timed: a Han character or a run of ASCII.
+
+    `start` and `end` are offsets into the transcript text, so a caller can
+    find what sits between two of them.
+    """
+
+    start: int
+    end: int
+    text: str
+
+
+# One Han character, or one whole run of ASCII letters and digits, is one
+# recognised unit. Measured on a real 3160.2 second run: 15883 Han characters
+# plus 25 ASCII runs is 15908, exactly the number of millisecond pairs the
+# engine returned, while the text has 17123 characters. The difference is
+# punctuation, which consumes no time at all.
+#
+# The ASCII run is one unit rather than one per letter, and that is not an
+# approximation. Measured on the same run, `GDP` appears 23 times, `WTO` 9
+# times, and pairing per character instead of per run overruns by exactly the
+# 61 extra letters those runs contain.
+_UNIT_RE = re.compile(r"[A-Za-z0-9]+|[\u3400-\u9fff]")
+
+# Where a segment may end. The four CJK marks are the obvious ones. `.` and `,`
+# are here because ct-punc writes western marks after ASCII words, and leaving
+# them out changes the measured segment count on a full run from 1152 to 1148.
+# The rest cost nothing to accept and cover marks other runs may produce.
+_CUT_MARKS = "，。？！、；：,.;:!?"
+
+
+def recognised_units(text: str) -> list[RecognisedUnit]:
+    """Split transcript text into the units the engine timed.
+
+    See `_UNIT_RE` for why a character and an ASCII run count alike.
+    """
+    return [
+        RecognisedUnit(start=m.start(), end=m.end(), text=m.group())
+        for m in _UNIT_RE.finditer(text)
+    ]
+
+
+def asr_segments(text: str, timestamps: list[list[int]]) -> list[Segment]:
+    """Pair engine text with engine timestamps, cutting at punctuation.
+
+    `timestamps` is the `timestamp` field of a result, a list of
+    `[start_ms, end_ms]` pairs. The cut is made by scanning the text for
+    punctuation rather than by reading the result's `sentence_info`, and that
+    is deliberate. On a full-length run, FunASR 1.4.16 groups sentences against
+    text it has split differently, so `sentence_info` text drifts away from the
+    top-level `text` starting at character 318. Its millisecond bounds are
+    correct, its text is not, so this module rebuilds the grouping instead.
+    Measured on the saved run, the two agree on every one of the 1152
+    boundaries, so nothing is lost by not reading it.
+
+    Fillers are not removed. `啊`, `呢`, `就是` and `这个` stay exactly where the
+    engine put them. Measured on the saved run, `text.count("啊")` is 277 and
+    `text.count("这个")` is 424. This is a decision rather than an oversight:
+    the transcript is meant to read as the speaker talked, and the same course
+    carries platform subtitles that keep fillers too.
+
+    Raises `AsrError` when the two counts disagree, and that check is the point
+    of the function rather than a courtesy. Any pairing made after a mismatch
+    is a guess that still produces plausible-looking output, which is the
+    failure mode worth refusing.
+    """
+    units = recognised_units(text)
+    if not units:
+        raise AsrError("the engine returned no transcript text")
+    if len(units) != len(timestamps):
+        raise AsrError(
+            f"the engine returned {len(units)} recognised units but "
+            f"{len(timestamps)} timestamps; no pairing can be trusted"
+        )
+
+    segments: list[Segment] = []
+    unit_cursor = 0  # First unit of the segment being built.
+    char_cursor = 0  # First character of the segment being built.
+    for i, unit in enumerate(units):
+        following = units[i + 1].start if i + 1 < len(units) else len(text)
+        cut = next(
+            (
+                unit.end + offset
+                for offset, char in enumerate(text[unit.end : following])
+                if char in _CUT_MARKS
+            ),
+            None,
+        )
+        if cut is None:
+            continue
+        segments.append(
+            Segment(
+                start_sec=timestamps[unit_cursor][0] / 1000,
+                end_sec=timestamps[i][1] / 1000,
+                text=text[char_cursor : cut + 1].strip(),
+            )
+        )
+        unit_cursor = i + 1
+        char_cursor = cut + 1
+
+    # Speech after the last mark has no mark of its own to end on, so it takes
+    # the end of the audio. Both the saved full-length run and a 60 second
+    # slice end this way.
+    tail = text[char_cursor:].strip()
+    if unit_cursor < len(units) and tail:
+        segments.append(
+            Segment(
+                start_sec=timestamps[unit_cursor][0] / 1000,
+                end_sec=timestamps[-1][1] / 1000,
+                text=tail,
+            )
+        )
+    return segments
+
+
+def detect_device(model) -> str:
+    """Where the model's parameters actually live, as a string.
+
+    Read from the parameters because the obvious attributes lie. Measured on
+    this machine, `model.device` raises AttributeError, and
+    `getattr(model.model, "device", None)` returns None even when the model is
+    on the CPU, which reads as "no information" rather than as "the CPU".
+    """
+    try:
+        parameters = model.model.parameters()
+    except AttributeError as exc:
+        raise AsrError(
+            "cannot read a device from this engine; it exposes no "
+            f"model.model.parameters() ({exc})"
+        ) from exc
+    try:
+        return str(next(parameters).device)
+    except StopIteration as exc:
+        raise AsrError(
+            "cannot read a device from this engine; its model has no parameters"
+        ) from exc
+
+
+def verify_device(model, requested: str) -> str:
+    """Confirm the requested device is the one in use, and report it back.
+
+    FunASR downgrades silently. Measured on this machine, passing
+    `device="cuda:0"` where `torch.cuda.is_available()` is False loads the
+    model on the CPU and returns a perfectly good transcript, so nothing
+    downstream can tell the two apart. Checking here is the only place the
+    difference is visible, and a caller who asked for a GPU wants to know it
+    did not get one.
+
+    Returns the actual device so a caller can record it.
+    """
+    actual = detect_device(model)
+    if requested.startswith("cuda") and not actual.startswith("cuda"):
+        raise AsrError(
+            f"requested device {requested} but the model is running on "
+            f"{actual}. FunASR does not report this itself."
+        )
+    return actual
+
+
+def engine_kwargs(device: str = "cpu") -> dict:
+    """The engine configuration, as the keyword arguments `AutoModel` takes.
+
+    `punc_model` is a requirement and not a refinement. Measured with it
+    disabled, the output is 1511 spaces among 3023 characters with no
+    punctuation of any kind, and there is then nothing in the text to cut a
+    segment on. It also reassembles the per-unit markers into continuous text.
+
+    CPU is the default because it is enough. Measured at 13.4 to 15.3 times
+    real time on this machine, so a 47 minute part takes under 4 minutes.
+    """
+    return {
+        "model": "paraformer-zh",
+        "vad_model": "fsmn-vad",  # Splits long audio into utterance chunks.
+        "punc_model": "ct-punc",
+        "device": device,
+        "disable_update": True,  # The models are cached; skip the online check.
+        "disable_pbar": True,    # A progress bar writes escape codes into logs.
+    }
+
+
+def load_engine(device: str = "cpu"):
+    """Build the ASR engine, or explain what is missing.
+
+    Imported here rather than at module scope so that probing, downloading and
+    subtitle retrieval keep working on a machine that has none of the ASR
+    stack. It is a 2 GB dependency and most callers never transcribe anything.
+    """
+    try:
+        from funasr import AutoModel
+    except ImportError as exc:
+        raise TranscriptionUnavailable(_MISSING_DEPS) from exc
+    model = AutoModel(**engine_kwargs(device))
+    verify_device(model, device)
+    return model
+
+
+def transcribe(
+    wav: Path,
+    engine=None,
+    device: str = "cpu",
+) -> list[Segment]:
+    """Turn one 16 kHz mono WAV into that part's timed segments.
+
+    One part per call, and the audio is expected to be the file
+    `download_audio` already produced. The model is 2 GB and lives behind the
+    `engine` argument, so a caller working through 30 parts loads it once and
+    passes it in rather than paying 29 to 50 seconds per part.
+
+    Device verification happens before the engine is handed any audio, so a
+    silently downgraded GPU request fails at startup rather than after minutes
+    of work.
+    """
+    if engine is None:
+        engine = load_engine(device)
+    verify_device(engine, device)
+    try:
+        result = engine.generate(input=str(wav), batch_size_s=300)[0]
+    except ImportError as exc:
+        # The fbank backend is imported lazily, at feature extraction rather
+        # than at model load, so a missing one surfaces here on the first file
+        # instead of at `load_engine`. Only that case is translated; any other
+        # import failure is a different problem and keeps its own traceback.
+        if "fbank" not in str(exc):
+            raise
+        raise TranscriptionUnavailable(_MISSING_DEPS) from exc
+    return asr_segments(result.get("text", ""), result.get("timestamp") or [])
 
 
 def main(argv: list[str] | None = None) -> int:

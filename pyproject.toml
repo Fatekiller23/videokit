@@ -4,7 +4,24 @@ version = "0.1.0"
 description = "B 站视频探测、下载与转文稿"
 requires-python = ">=3.12"
 
-# websocket-client is the CDP transport. It is the only Python dependency the
-# package has; yt-dlp and ffmpeg are external programs, and funasr belongs to
-# the transcription stage rather than to this one.
+# websocket-client is the CDP transport. It is the only dependency the probe,
+# download and subtitle paths need; yt-dlp and ffmpeg are external programs.
 dependencies = ["websocket-client>=1.7"]
+
+# Speech recognition, kept in an extra rather than in the base install because
+# it is roughly 2 GB and most callers never transcribe anything. Probing,
+# downloading and subtitle retrieval all work without it.
+#
+# All three are required, and the third is the one that is easy to miss.
+# `funasr` and `torch` alone install cleanly and load a model successfully,
+# then fail the moment audio arrives, measured on this machine as
+# `ImportError: torchaudio is not installed and neither is the
+# kaldi-native-fbank fallback backend. FunASR needs one fbank backend for
+# feature extraction.`
+#
+# Either backend satisfies it. This package names kaldi-native-fbank because it
+# does not pin a torch version the way torchaudio does.
+#
+#   uv sync --extra asr
+[project.optional-dependencies]
+asr = ["funasr>=1.4", "torch>=2.0", "kaldi-native-fbank>=1.20"]
