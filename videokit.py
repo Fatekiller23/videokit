@@ -43,6 +43,11 @@ _SUB_ROW = re.compile(
 # no subtitles at all.
 _NOT_A_SUBTITLE = {"danmaku"}
 
+# The Chrome profile that carries the Bilibili login. Named here because
+# `.gitignore` must cover it as well as the cookie file: it holds the same
+# credential, so ignoring only the file would leave the login committable.
+PROFILE_DIRNAME = "browser-profile"
+
 
 @dataclass(frozen=True)
 class Part:
@@ -457,7 +462,7 @@ def login(chrome: Path | None = None, timeout_sec: float = 180.0) -> Path:
     Netscape file yt-dlp reads, and closes the browser. The profile stays on
     disk, so this is a one-time cost per machine rather than per run.
     """
-    profile = default_data_dir() / "browser-profile"
+    profile = default_data_dir() / PROFILE_DIRNAME
     profile.mkdir(parents=True, exist_ok=True)
     port = _debug_port()
     argv = chrome_argv(

@@ -442,6 +442,25 @@ class GitignoreCoverage(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("cookies", proc.stdout)
 
+    def test_a_copied_browser_profile_would_still_be_ignored(self):
+        # The profile holds the same login the cookie file does, so copying the
+        # data directory into the repo must not be committable either. Checked
+        # as a directory and as the cookie store inside it, because a pattern
+        # that catches one need not catch the other.
+        for copied in (
+            f"{videokit.PROFILE_DIRNAME}/",
+            f"{videokit.PROFILE_DIRNAME}/Default/Network/Cookies",
+        ):
+            with self.subTest(path=copied):
+                proc = subprocess.run(
+                    ["git", "check-ignore", "-v", copied],
+                    cwd=self.repo,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, f"{copied} not ignored")
+                self.assertIn(videokit.PROFILE_DIRNAME, proc.stdout)
+
 
 class FakeSocket:
     """A stand-in for the CDP WebSocket that records what was sent."""

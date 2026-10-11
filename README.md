@@ -85,7 +85,9 @@ videokit.reuse_or_login()    # 已有凭据就复用，没有才拉起浏览器
 **放进仓库是不允许的，这一条编码成结构而不是靠记忆。** 两道独立的防线：
 
 - 路径在仓库工作区之外，就地放进仓库这个错误本身不可用。
-- `.gitignore` 里有 `cookies.txt` 与 `*cookies*.txt`，万一有人手工复制进来，`git check-ignore` 仍然拦住。
+- `.gitignore` 里有 `cookies.txt`、`*cookies*.txt` 与 `browser-profile/`，万一有人手工把数据目录复制进来，`git check-ignore` 仍然拦住。
+
+第三条容易漏。**浏览器 profile 与凭据文件同级敏感**，它带着同一个登录态，只挡 `cookies.txt` 会漏掉 profile 这一半。断言因此同时查目录本身与目录里的 Cookie 库文件。
 
 `VIDEOKIT_DATA_DIR` 可覆盖数据目录，测试靠它保持隔离。
 
@@ -156,7 +158,7 @@ Video
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-50 项断言，约 3.5 秒，不联网、不需要登录态。
+51 项断言，约 3.5 秒，不联网、不需要登录态。
 
 跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
