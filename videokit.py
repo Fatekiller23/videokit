@@ -43,6 +43,13 @@ _SUB_ROW = re.compile(
 # no subtitles at all.
 _NOT_A_SUBTITLE = {"danmaku"}
 
+# yt-dlp's own words when it found no session. Printed to stderr, exit code 0.
+# Measured across six inputs in recon.md: present whenever the credentials are
+# missing or rejected, absent when they are good and the video simply has no
+# subtitles. It is the only signal that separates those two, so the login
+# judgment hangs on this string rather than on the exit code.
+_LOGIN_WARNING = "Subtitles are only available when logged in"
+
 # The Chrome profile that carries the Bilibili login. Named here because
 # `.gitignore` must cover it as well as the cookie file: it holds the same
 # credential, so ignoring only the file would leave the login committable.
@@ -74,6 +81,25 @@ class Video:
     formats: tuple[dict, ...] = field(default_factory=tuple)
 
 
+def login_needed(subs: dict[str, tuple[str, ...]], stderr: str) -> bool:
+    """Whether this run failed for want of a login.
+
+    Two signals, both required, because neither alone is sufficient. The exit
+    code is useless here: all six measured inputs exited 0, including the ones
+    with no credentials at all.
+
+    Any real track anywhere in the video proves the credentials work, so the
+    empty check is over the whole video rather than per part. A course whose p1
+    has no subtitles and whose p3 has them is a valid login, not a failure.
+
+    Never reported as "expired". Expired and never-logged-in measure the same,
+    so the caller is told what to do instead of what went wrong.
+    """
+    if any(subs.values()):
+        return False
+    return _LOGIN_WARNING in stderr
+
+
 class VideoKitError(RuntimeError):
     """Raised when yt-dlp fails in a way the caller must handle."""
 
@@ -98,13 +124,30 @@ def _ytdlp_command() -> tuple[str, ...]:
     )
 
 
-def _run(args: list[str], cookies: Path | None) -> str:
-    """Run yt-dlp and return stdout, or raise with its stderr attached.
+@dataclass(frozen=True)
+class RunOutput:
+    """Both streams of one successful yt-dlp run.
+
+    stderr is carried even on success because the login warning is written
+    there while the exit code stays 0. Dropping it makes a logged-out empty
+    subtitle table identical to one for a video that has no subtitles.
+    """
+
+    stdout: str
+    stderr: str
+
+
+def _run(args: list[str], cookies: Path | None) -> RunOutput:
+    """Run yt-dlp and return both streams, or raise with stderr attached.
 
     One place resolves credentials, so every caller gets the same behavior
     whether it passes a path, passes None, or omits the argument. A caller that
     names a file always wins; otherwise the stored login is used if there is
     one.
+
+    Both streams are returned rather than stdout alone. yt-dlp writes the login
+    warning to stderr while exiting 0, so stdout-only cannot tell a logged-out
+    run from a video that has no subtitles.
 
     Encoding is left to the platform on purpose. yt-dlp writes its output in
     the console's code page (cp936 on this machine), not UTF-8, so forcing
@@ -124,7 +167,7 @@ def _run(args: list[str], cookies: Path | None) -> str:
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").splitlines()[-8:])
         raise VideoKitError(f"yt-dlp failed (exit {proc.returncode}):\n{tail}")
-    return proc.stdout
+    return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
 
 
 def netscape_text(cookies: list[dict]) -> str:
@@ -273,6 +316,15 @@ class LoginError(VideoKitError):
     Carries the failing step in its message. The four ways this fails are
     indistinguishable from outside, so the message is the only thing that tells
     a caller where to look.
+    """
+
+
+class LoginRequired(VideoKitError):
+    """Raised when a run needed a session and did not have a working one.
+
+    Distinct from `LoginError`, which is about the guided login failing. This
+    one says the scrape came back with nothing because there was no login, and
+    it carries the command that fixes it.
     """
 
 
@@ -509,20 +561,45 @@ def parse_subtitle_table(text: str) -> dict[str, tuple[str, ...]]:
     return {k: tuple(sorted(v - _NOT_A_SUBTITLE)) for k, v in found.items()}
 
 
+def login_required_message() -> str:
+    """What the user is told when a scrape came back empty for want of a login.
+
+    Names what to do rather than what went wrong. Expired, revoked and
+    never-logged-in are externally identical, measured in recon.md, so
+    asserting a cause would be a guess presented as a finding. The raw yt-dlp
+    warning is left out on purpose: it reads as a bug report, and the ticket's
+    point is that the user gets a next step instead.
+    """
+    return (
+        "Bilibili returned no subtitle tracks and reported that subtitles "
+        "need a login. A credential that was never obtained and one that has "
+        "stopped working look identical from the outside, so nothing is "
+        "claimed about which one this is.\n"
+        "Run this to obtain a credential:\n"
+        "    uv run --python 3.12 python videokit.py login"
+    )
+
+
 def probe(url: str, cookies: Path | None = None) -> Video:
     """Report what exists at `url` without downloading file data.
 
     Two yt-dlp calls: JSON for structure and formats, `--list-subs` for
     subtitles, because the JSON path does not expose subtitles for Bilibili.
+
+    Raises `LoginRequired` when the subtitle call came back with nothing and
+    yt-dlp said a login was missing. Refusing here is the point: the caller
+    would otherwise get 30 parts that all report no subtitles, send every one
+    of them to speech recognition, and never learn why.
     """
     raw = _run(
         ["--dump-single-json", "--skip-download", url],
         cookies,
-    )
+    ).stdout
     data = json.loads(raw)
-    subs = parse_subtitle_table(
-        _run(["--list-subs", "--skip-download", url], cookies)
-    )
+    subs_run = _run(["--list-subs", "--skip-download", url], cookies)
+    subs = parse_subtitle_table(subs_run.stdout)
+    if login_needed(subs, subs_run.stderr):
+        raise LoginRequired(login_required_message())
 
     entries = data.get("entries") or [data]
     parts = []
@@ -592,7 +669,7 @@ def _download(
         "--print", "after_move:filepath",
         url,
     ]
-    stdout = _run(args + extra, cookies)
+    stdout = _run(args + extra, cookies).stdout
     return [Path(line) for line in stdout.splitlines() if line.strip()]
 
 
