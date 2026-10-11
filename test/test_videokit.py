@@ -2237,6 +2237,15 @@ class TranscriptCommand(unittest.TestCase):
         # The acceptance criterion as the user meets it: one part fails, the
         # command still finishes, and the summary says which part failed and
         # whether running it again would help.
+        #
+        # The exit code is nonzero when any part failed. Ticket #18 had this
+        # command exit 0 on a failed part, on the reasoning that what matters is
+        # whether the batch ran to the end. That was reversed for this command,
+        # because the caller this entry point exists for is another program:
+        # the workspace gets a process exit code and not this module's records,
+        # so `videokit transcript BVxxx && echo done` would print done on a run
+        # where every part failed. The summary text is for a person; parsing it
+        # to learn whether the work succeeded is not a reasonable ask.
         raising = _RaisingEngine(
             {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
             fails_on=str(self.audio / "01.wav"),
@@ -2245,12 +2254,52 @@ class TranscriptCommand(unittest.TestCase):
         videokit.load_engine = lambda device="cpu": raising
         with contextlib.redirect_stdout(self.buffer):
             code = videokit.main(self._argv("--parts", "1,3"))
-        self.assertEqual(code, 0)
+        self.assertNotEqual(code, 0)
         printed = self.buffer.getvalue()
         self.assertIn("delivered 1 of 2", printed)
         self.assertIn("1 (asr_error, retryable)", printed)
         names = sorted(p.name for p in self.out.iterdir())
         self.assertEqual([n[:2] for n in names], ["03"])
+
+    def test_a_batch_where_every_part_fails_still_exits_nonzero(self):
+        # The case that motivated the reversal. A stale login is not swallowed
+        # into failed records, but a whole course can still fail part by part,
+        # and a caller that only reads the exit code must not read that as done.
+        # Parts 1, 2, 6 and 7 have no platform track, so all four go to the
+        # engine, and this engine refuses every file it is given.
+        class AlwaysFailing(_Engine):
+            def generate(self, **kwargs):
+                raise RuntimeError("boom")
+
+        videokit.load_engine = lambda device="cpu": AlwaysFailing(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS}
+        )
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(self._argv("--parts", "1,2,6,7"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("delivered 0 of 4", self.buffer.getvalue())
+
+    def test_a_run_where_every_part_succeeds_exits_zero(self):
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(self._argv("--parts", "3,4"))
+        self.assertEqual(code, 0)
+
+    def test_a_run_that_skipped_every_part_exits_zero(self):
+        # Skipped parts are finished work, not failures. A second run over a
+        # complete course is the normal way to use this command, so it must
+        # report success.
+        #
+        # Parts 1 and 4 are chosen from the measured numbers because both of
+        # their delivered sizes clear `transcript_complete`'s density floor
+        # (12512 characters against floors of 10313 and 10586). Part 3's does
+        # not, so it would be re-transcribed and the run would not be all-skipped.
+        with contextlib.redirect_stdout(self.buffer):
+            first = videokit.main(self._argv("--parts", "1,4"))
+        self.assertEqual(first, 0)
+        with contextlib.redirect_stdout(self.buffer):
+            second = videokit.main(self._argv("--parts", "1,4"))
+        self.assertEqual(second, 0)
+        self.assertIn("skipped 2", self.buffer.getvalue())
 
     def test_a_url_works_as_well_as_a_bare_bv_number(self):
         with contextlib.redirect_stdout(self.buffer):

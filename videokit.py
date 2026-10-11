@@ -2002,6 +2002,11 @@ _USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
   videokit video BV1Y5QgB5Eas --quality 720p --parts 3,4 --out videos
   videokit audio BV1Y5QgB5Eas --out audio
   videokit transcript BV1Y5QgB5Eas --out transcripts
+
+退出码
+  0   成功。transcript 下含「全部跳过」的情况，跳过是已完成的工作。
+  1   运行失败，或 transcript 有讲次 status 为 failed，或 video/audio 有讲次失败。
+  2   命令行参数有问题。
 """
 
 # One entry per subcommand: the usage line a reader can copy, then what the
@@ -2027,7 +2032,8 @@ _SUBCOMMANDS: dict[str, tuple[str, str]] = {
         "videokit transcript <BV号或链接> [--parts 3,4] [--out 目录] "
         "[--audio-out 目录]",
         "逐讲判定并产出文稿。有字幕的取平台字幕，无字幕的取音频跑本地语音识别，"
-        "两者都写成交付文稿，不需要另跑一条命令。",
+        "两者都写成交付文稿，不需要另跑一条命令。已有产物的讲次跳过。"
+        "结尾按 ok / skipped / failed 分类汇总，任何一讲 failed 时退出码非零。",
     ),
     "login": (
         "videokit login",
@@ -2530,6 +2536,18 @@ def _transcript_command(rest: list[str]) -> int:
     stdout to a file still gets the delivered report there and the running
     commentary on the terminal. A full run is about 48 minutes, and silence for
     that long reads as a hang.
+
+    The exit code reports whether every part produced a transcript. A failed
+    part makes it nonzero; a run where all parts succeeded or were already
+    delivered exits zero.
+
+    That reverses ticket #18, which exited zero on a failed part on the
+    reasoning that the batch had run to the end. This command's caller is
+    another program, and the workspace sees the exit code rather than the
+    records: `videokit transcript BVxxx && echo done` would print done on a run
+    where every part failed. The exit code is the machine-readable answer, so
+    it answers the question a caller has. The summary text stays for the
+    person, and the two do not need to agree on what "finished" means.
     """
     references = _references(rest)
     if not references:
@@ -2565,7 +2583,10 @@ def _transcript_command(rest: list[str]) -> int:
     print(report)
     if tally:
         print(tally)
-    return 0
+    # Read off the records rather than recomputed. `failed` is the field other
+    # tickets own, and every other status is treated as a part that produced
+    # its artifact.
+    return 1 if any(r.status == "failed" for r in records) else 0
 
 
 def _parse_parts(selection: str) -> list[int]:
