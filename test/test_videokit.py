@@ -1680,12 +1680,11 @@ class BatchRun(unittest.TestCase):
         self.assertEqual([r.source for r in records], ["asr", "platform"])
         self.assertEqual(len(list(self.out.iterdir())), 2)
 
-    def test_a_part_whose_audio_cannot_be_fetched_is_left_for_ticket_18(self):
-        # Ticket #18 owns failure recording. This asserts the room it will use:
-        # no audio means no transcript, the part is not written as `ok`, and
-        # the batch carries on. #18 turns this into `failed` with
-        # `failure_reason = "no_audio"`, the value that says retrying is
-        # pointless. `transcribe` must not be reached, because there is no file.
+    def test_a_part_whose_audio_cannot_be_fetched_is_recorded_as_no_audio(self):
+        # No audio means no transcript, the part is recorded as `failed` with
+        # `failure_reason = "no_audio"`, the batch carries on, and nothing is
+        # written for it. `transcribe` must not be reached, because there is no
+        # file to hand it.
         def no_audio(args, cookies):
             self.calls.append(args)
             if "--dump-single-json" in args:
@@ -1701,10 +1700,15 @@ class BatchRun(unittest.TestCase):
 
         videokit._run = no_audio
         records = self._run_all(parts=[1, 3])
-        self.assertEqual([r.status for r in records], ["pending", "ok"])
+        self.assertEqual([r.status for r in records], ["failed", "ok"])
+        # The two fields are separate and the reason names the audio, not the
+        # ASR. That distinction is the whole point of carrying both.
+        self.assertEqual(records[0].failure_reason, "no_audio")
+        self.assertIsNone(records[1].failure_reason)
         self.assertIsNone(records[0].source)
         self.assertEqual(records[0].segments, ())
         self.assertEqual(self.engine.calls, [])
+        # The part that worked is still delivered. One failure does not undo it.
         self.assertEqual(
             [p.name[:2] for p in sorted(self.out.iterdir())], ["03"]
         )
@@ -1804,6 +1808,25 @@ class TranscriptCommand(unittest.TestCase):
         self.assertIn("9", printed)
         self.assertIn("platform", printed)
         self.assertIn("ASR", printed)
+
+    def test_a_failed_part_is_reported_on_the_command_line(self):
+        # The acceptance criterion as the user meets it: one part fails, the
+        # command still finishes, and the summary says which part failed and
+        # whether running it again would help.
+        raising = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "01.wav"),
+            exc=RuntimeError("boom"),
+        )
+        videokit.load_engine = lambda device="cpu": raising
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(self._argv("--parts", "1,3"))
+        self.assertEqual(code, 0)
+        printed = self.buffer.getvalue()
+        self.assertIn("delivered 1 of 2", printed)
+        self.assertIn("1 (asr_error, retryable)", printed)
+        names = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual([n[:2] for n in names], ["03"])
 
     def test_a_url_works_as_well_as_a_bare_bv_number(self):
         with contextlib.redirect_stdout(self.buffer):
@@ -2007,6 +2030,227 @@ class _Engine:
     def generate(self, **kwargs):
         self.calls.append(kwargs)
         return [self._result]
+
+
+class _RaisingEngine(_Engine):
+    """An engine that fails on one part's audio and works on every other.
+
+    A real per-part ASR failure, modelled on what the stack actually raises:
+    the model is loaded and healthy, and one file it is given cannot be
+    processed. The failure is a property of that part, which is what makes it
+    distinguishable from a missing install or a stale login.
+    """
+
+    def __init__(self, result: dict, fails_on: str, exc: Exception):
+        super().__init__(result)
+        self.fails_on = fails_on
+        self.exc = exc
+
+    def generate(self, **kwargs):
+        if str(kwargs.get("input", "")).startswith(self.fails_on):
+            raise self.exc
+        return super().generate(**kwargs)
+
+
+class FailureSurvival(unittest.TestCase):
+    """One part failing is recorded, reported, and does not end the batch.
+
+    The two failure reasons are separate values because they call for opposite
+    responses. `no_audio` cannot be fixed by retrying, `asr_error` can, and a
+    caller that cannot tell them apart either wastes an hour on the first or
+    abandons a transcript it could have had on the second.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original_run = videokit._run
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+        self.audio = self.tmp / "audio"
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / f"{part:02d}.wav"))
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original_run)
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _run_all(self, engine=None, parts=None):
+        return videokit.transcripts(
+            "BV1Y5QgB5Eas",
+            self.out,
+            parts=parts or [1, 2, 3],
+            audio_dir=self.audio,
+            engine=engine,
+        )
+
+    def test_one_part_that_fails_is_recorded_and_the_rest_continue(self):
+        # Parts 1, 2 and 3 all have no track, so all three go through ASR and
+        # the middle one fails. The other two must still be delivered.
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "02.wav"),
+            exc=RuntimeError("CUDA out of memory"),
+        )
+        records = self._run_all(engine=engine)
+        self.assertEqual([r.index for r in records], [1, 2, 3])
+        self.assertEqual([r.status for r in records], ["ok", "failed", "ok"])
+        self.assertEqual(
+            [r.failure_reason for r in records], [None, "asr_error", None]
+        )
+        # A failed part carries no transcript and claims no source, so nothing
+        # downstream can mistake it for a delivered one.
+        failed = records[1]
+        self.assertEqual(failed.segments, ())
+        self.assertIsNone(failed.source)
+        self.assertEqual(failed.bvid, "BV1Y5QgB5Eas")
+        self.assertIn("02-", videokit.transcript_filename(failed))
+        # The two healthy parts are really on disk, with real prose in them.
+        written = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual([n[:2] for n in written], ["01", "03"])
+        self.assertTrue((self.out / written[0]).read_text(encoding="utf-8").strip())
+        self.assertTrue((self.out / written[1]).read_text(encoding="utf-8").strip())
+
+    def test_the_batch_summary_names_the_failed_parts_and_their_reasons(self):
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "02.wav"),
+            exc=RuntimeError("boom"),
+        )
+        records = self._run_all(engine=engine)
+        report = videokit.transcript_report(records, self.out)
+        self.assertIn("2 (asr_error, retryable)", report)
+        self.assertIn("delivered 2 of 3", report)
+
+    def test_the_two_reasons_stay_apart_in_one_batch(self):
+        # Part 1 fails for want of audio, part 2 fails inside the engine. A
+        # single field could not tell the caller that only one of the two is
+        # worth retrying.
+        def one_part_has_no_audio(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run("" if part == 1 else str(self.audio / f"{part:02d}.wav"))
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = one_part_has_no_audio
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "02.wav"),
+            exc=RuntimeError("boom"),
+        )
+        records = self._run_all(engine=engine)
+        self.assertEqual(
+            [r.failure_reason for r in records], ["no_audio", "asr_error", None]
+        )
+        self.assertEqual([r.status for r in records], ["failed", "failed", "ok"])
+        report = videokit.transcript_report(records, self.out)
+        self.assertIn("1 (no_audio, not retryable)", report)
+        self.assertIn("2 (asr_error, retryable)", report)
+        self.assertEqual([p.name[:2] for p in sorted(self.out.iterdir())], ["03"])
+
+    def test_the_summary_says_which_failures_a_rerun_would_fix(self):
+        # The reason the two fields exist, made visible to the person reading
+        # the summary. They have just waited 40 minutes; the line has to tell
+        # them which parts are worth running again and which are not, without
+        # their having to look up what the reason strings mean.
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "02.wav"),
+            exc=RuntimeError("boom"),
+        )
+        report = videokit.transcript_report(self._run_all(engine=engine), self.out)
+        self.assertIn("2 (asr_error, retryable)", report)
+        self.assertNotIn("no_audio", report)
+        self.assertIn("delivered 2 of 3", report)
+
+    def test_a_failed_part_is_not_counted_as_delivered(self):
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "02.wav"),
+            exc=RuntimeError("boom"),
+        )
+        records = self._run_all(engine=engine)
+        report = videokit.transcript_report(records, self.out)
+        self.assertIn("delivered 2 of 3 parts", report)
+        self.assertEqual(len(list(self.out.iterdir())), 2)
+
+    def test_a_missing_asr_install_is_not_recorded_as_thirty_failed_parts(self):
+        # The install fault is one machine-level problem, not one per part. The
+        # message naming the three packages is the only thing that fixes it, so
+        # it has to arrive intact instead of being turned into 30 records that
+        # all say `asr_error` and read like the course is at fault.
+        def no_engine(device="cpu"):
+            raise videokit.TranscriptionUnavailable("the ASR stack is not installed")
+
+        original = videokit.load_engine
+        videokit.load_engine = no_engine
+        self.addCleanup(setattr, videokit, "load_engine", original)
+        with self.assertRaises(videokit.TranscriptionUnavailable) as ctx:
+            self._run_all()
+        self.assertIn("not installed", str(ctx.exception))
+        # Untouched: nothing was written and nothing was reported as a part
+        # that failed on its own.
+        self.assertFalse(self.out.exists())
+
+    def test_the_only_statuses_are_the_ones_the_spec_names(self):
+        # `pending` was ticket #17's placeholder for "this part has no audio
+        # yet". With failures recorded there is no third state left to name, so
+        # the value is gone rather than left as vocabulary nothing produces.
+        record = videokit._failed_record(
+            "BV1Y5QgB5Eas",
+            videokit.Part(7, "BV1Y5QgB5Eas_p7", "07-t", 10.0, ()),
+            "no_audio",
+        )
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.failure_reason, "no_audio")
+        source = (
+            Path(__file__).resolve().parent.parent / "videokit.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('"pending"', source)
+
+    def test_a_failure_does_not_invalidate_a_part_already_completed(self):
+        # The part that was delivered before the failure keeps its file and its
+        # text. Failing one part must not retroactively withdraw another.
+        engine = _RaisingEngine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS},
+            fails_on=str(self.audio / "01.wav"),
+            exc=RuntimeError("boom"),
+        )
+        records = self._run_all(engine=engine, parts=[1, 3])
+        self.assertEqual([r.status for r in records], ["failed", "ok"])
+        delivered = self.out / videokit.transcript_filename(records[1])
+        self.assertTrue(delivered.is_file())
+        self.assertEqual(
+            delivered.read_text(encoding="utf-8"),
+            videokit.transcript_text(records[1].segments),
+        )
+        # The failed part's file is absent rather than empty, because an empty
+        # file reads as a finished transcript.
+        self.assertFalse(
+            (self.out / videokit.transcript_filename(records[0])).exists()
+        )
 
 
 class AsrSegmentation(unittest.TestCase):

@@ -141,6 +141,8 @@ records = videokit.transcripts("BV1Y5QgB5Eas", Path("transcripts"))
 
 命令结尾的汇总按来源分列，并点名哪些讲次来自 ASR。没有这一行，一门课的文稿里有几分钟是机器听写的、几分钟是平台字幕抄的，读的人看不出来。
 
+**一讲失败时命令仍然退出 0。** 判据是整批是否跑完，不是每一讲是否成功。失败讲次在汇总行里点名并说明该不该重试，退出码留给「整批没能跑完」这一类故障，例如登录失效或视频取不到。要把失败也当成非零退出，调用方读 `records` 里有没有 `status == "failed"`，那个信息比退出码精确。
+
 ### `source` 只服务程序，不进交付文稿
 
 **这一条必须写清楚，否则后来者会认为规格自相矛盾。**
@@ -165,7 +167,9 @@ records = videokit.transcripts("BV1Y5QgB5Eas", Path("transcripts"))
 
 **除了 `source` 与 `language`，两个记录的每个字段都以同样方式填。** 所以下游拿到一个 `PartTranscript` 时不需要问它从哪来，`write_transcript` 也不问。这是本票要的合流，也是「不需要另跑一条命令」的实现。
 
-**`pending` 现在只在一种情况下出现。** 它是规格的 `ok` / `failed` 之外的第三个取值，本票只用它表示「这一讲连音频都没取到，没有文稿可写」。这种情况不中止整批，也不写文件。
+**`status` 只有 `ok` 与 `failed` 两个取值。** #17 曾经有个第三值 `pending`，表示「这一讲有讲次但音频还没取」。两个结果现在都在同一趟里定下来，`pending` 已删除。没有任何代码路径能产出的取值留着，只会让调用方去处理一个不可能发生的分支。
+
+**一讲失败不中止整批，也不写文件。** 走 ASR 的讲次抛错时记成 `failed`，`failure_reason` 为 `asr_error`，批次继续。已经写完的讲次不受影响，每一讲是完成即写，没有回退。
 
 **引擎在一批里只加载一次。** 实测加载 29 到 50 秒，47 分钟的一讲转写约 200 秒。逐讲重加载会给一批 30 讲加上约 20 分钟。做法是 `_DeferredEngine`，第一次真正用到时才建，之后复用；调用方自己持有引擎时从 `engine=` 传进来，`_DeferredEngine` 就不参与。**整批都不需要语音识别时，一次加载都不发生。**
 
@@ -405,7 +409,7 @@ PartTranscript
   source          "platform" | "asr" | None。中间产物用，不进交付文稿
   language        "ai-zh" | "zh" | None
   segments        Segment 元组
-  status          "ok" | "pending" | "failed"
+  status          "ok" | "failed"
   failure_reason  None | "no_audio" | "asr_error"
 
 RecognisedUnit
@@ -416,7 +420,7 @@ RecognisedUnit
 
 `source` 与交付文稿的分层见「`source` 只服务程序，不进交付文稿」。
 
-`status` 与 `failure_reason` 分开，因为失败原因决定重跑策略。`no_audio` 重试多少次都不会成功，`asr_error` 可以重试。混成一个字段，调用方就无从判断该重试还是放弃。本票不产出 `failed` 记录，那条路径属于 #18。
+`status` 与 `failure_reason` 分开，因为失败原因决定重跑策略。**`no_audio` 重试多少次都不会成功，`asr_error` 可以重试。** 混成一个字段，调用方就无从判断该重试还是放弃。失败汇总把这条后果直接写出来，`failed: 2 (asr_error, retryable)`，读者不必回头查两个字符串的含义。
 
 **本票的 `source` 只有两个取值，且两条路径都会产出 `ok` 记录。** `"platform"` 与 `"asr"` 的区别只剩来源，结构完全一致。`language` 随之分别是探到的轨语言与 `"zh"`。
 
@@ -481,9 +485,9 @@ RecognisedUnit
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-**实测 175 项断言，约 8 秒，不联网、不需要登录态、不需要 GPU、不需要 funasr。** 跑法用标准库 `unittest`，不是 pytest。
+**实测 189 项断言，约 10 秒，不联网、不需要登录态、不需要 GPU、不需要 funasr。** 跑法用标准库 `unittest`，不是 pytest。
 
-（早先这份 README 写的数字与实测不符，已按 `Ran 175 tests` 的实际输出改正。改动测试后请重跑一次并同步这里。）
+（早先这份 README 写的数字与实测不符，已按 `Ran 189 tests` 的实际输出改正。改动测试后请重跑一次并同步这里。）
 
 跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
@@ -547,12 +551,21 @@ uv run --python 3.12 --extra asr python test/_live_asr.py
 
 它跑真实的 47.5 分钟音频，约 4 分钟。默认读 `D:\projects\ecobuddy-notes\audio\06.wav`，即 `BV1Y5QgB5Eas_p6`。会打印加载与转写耗时、校验后的设备、分段数、标点覆盖率与填充词计数。跑之前不要设 `PYTHONIOENCODING`。
 
+**失败存活另有一个手工脚本，不进测试套件。**
+
+```
+uv run --python 3.12 --extra asr python test/_live_failure_survival.py
+```
+
+两个场景，都对真实课程跑。A 用真引擎加一个只在某一讲音频上抛错的包装，其余讲次真转写，实测 6.9 分钟、7 讲里 1 讲 `asr_error`、其余 6 讲各留下文件。B 让真实 `yt-dlp` 去取一个不存在的分P（实测 0、31、99 都返回空列表且不写文件），那一讲走生产路径得到 `no_audio`，实测 79 秒。两个场景都打印 `transcript_report` 的汇总行并核对磁盘上哪些文件在、哪些不在。
+
 **测试不依赖 funasr。** 这一条是硬要求，所以分两层处理。
 
 - 配对与分段是纯函数，夹具是真实运行的原始产物，不需要模型。
 - 设备校验与 `transcribe` 用一个假的引擎对象，它有 `model.model.parameters()` 与 `generate()` 两个被读到的属性。真实引擎由手工脚本覆盖。
 - 「缺依赖时说什么」这条测试用 `sys.modules["funasr"] = None` 模拟导入失败，所以在一台真没装 funasr 的机器上同样通过。
 - **合流这一层用同一个假引擎。** `transcripts` 与 `part_transcript` 都接受 `engine=`，所以「一批加载一次」「有字幕的讲次从不碰引擎」「无音频的讲次不写文件」都能在没有模型的前提下定死。`_DeferredEngine` 的惰性也不靠真加载来证明，测试数的是 `load_engine` 被调了几次。
+- **失败存活用同一个假引擎的变体。** 它在某一讲的音频上抛 `RuntimeError`，于是「一讲失败、其余继续、汇总报出原因」这一条不需要真模型就能断言，也不依赖网络与 GPU。真引擎那一侧的对照由上面的手工脚本给出。
 
 ## 已知限制
 
@@ -579,7 +592,9 @@ uv run --python 3.12 --extra asr python test/_live_asr.py
 
 **一次全量跑是长任务。** 实测 `BV1Y5QgB5Eas` 一次约 45 分钟，其中语音识别约 39 分钟。跑之前按后台任务安排，不要用会超时的前台命令。
 
-**无音频的讲次还没有失败记录。** 本票遇到取不到音轨的讲次时既不中止整批也不写文件，返回 `pending`。把它记成 `failed` 并附 `failure_reason = "no_audio"` 属于 #18，代码里留了明确的位置与注释。
+**一讲失败会被记录并继续，整批跑完给出汇总。** 取不到音轨的讲次记 `failed` 加 `failure_reason = "no_audio"`；ASR 抛错的讲次记 `failed` 加 `asr_error`。两种都不写文件，都不中止整批，都不回溯已交付的讲次。跑完打印 `failed: 2 (asr_error, retryable), 7 (no_audio, not retryable)` 这样的行，名字与原因都在其中。
+
+**两个机器级故障不算讲次失败。** 登录态失效会让每一讲都读成没字幕，缺 ASR 依赖会让每一讲都倒在引擎上。这两种各自只报一次并带出修复动作，不会变成三十条讲次失败。判据是异常类型，`LoginRequired` 与 `TranscriptionUnavailable` 直接上抛。
 
 **ASR 分段粒度是句，不是词。** 对照过 `sentence_info` 的毫秒边界，逐段相等。词级时间戳虽然从 `timestamp` 能拿到，本包不产出。
 
