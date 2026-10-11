@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -935,6 +936,477 @@ class SubtitleRetrieval(unittest.TestCase):
         # relied on a written file could not work from these bytes.
         segments = videokit.part_subtitles("u", 18)
         self.assertTrue(all(isinstance(s, videokit.Segment) for s in segments))
+
+
+# Which parts of BV1Y5QgB5Eas carry an `ai-zh` track, read off the recorded
+# `--list-subs` output. The nine without one are interleaved among the rest and
+# two of them lead the course, so a batch that stopped on the first would
+# produce no file at all.
+PARTS_WITH_SUBTITLES = (3, 4, 5, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 29, 30)
+PARTS_WITHOUT_SUBTITLES = (1, 2, 6, 7, 8, 9, 13, 23, 28)
+
+
+def segment(text: str) -> videokit.Segment:
+    """A segment carrying only the text under test."""
+    return videokit.Segment(start_sec=0.0, end_sec=1.0, text=text)
+
+
+def stub_run(payload: str):
+    """A stubbed `_run` result, in the shape the installed module expects.
+
+    Ticket #13 changes this seam's return type from `str` to `RunOutput`, which
+    carries stderr as well because yt-dlp writes its login warning there and
+    exits 0. The two tickets land separately, so this adapts to whichever shape
+    it finds and the stub keeps working across the merge.
+    """
+    output = getattr(videokit, "RunOutput", None)
+    if output is None:
+        return payload
+    return output(stdout=payload, stderr="")
+
+
+class TranscriptText(unittest.TestCase):
+    """Turning timed segments into the continuous prose that gets delivered.
+
+    The separator rule is measured, not chosen. Over all 21 recorded tracks,
+    40283 segments produce 40262 boundaries and exactly 55 of them carry an
+    ASCII alphanumeric character on both sides. Those 55 are where a bare
+    `"".join` welds two words together, measured example `very good` followed
+    by `Good` becoming `very goodGood`. The other 40207 boundaries carry no
+    separator in the source, and 38994 of them sit between two Chinese
+    characters, so `" ".join` would inject 38994 spaces that are not there.
+    """
+
+    def test_empty_input_yields_empty_text(self):
+        self.assertEqual(videokit.transcript_text([]), "")
+
+    def test_a_single_segment_is_its_own_text(self):
+        self.assertEqual(videokit.transcript_text([segment("呃现在我们来")]), "呃现在我们来")
+
+    def test_two_chinese_segments_are_joined_with_nothing(self):
+        # 38994 of the 40262 real boundaries look like this. A space here is
+        # not in the source text.
+        joined = videokit.transcript_text([segment("政治阻力极大啊"), segment("也不可能啊")])
+        self.assertEqual(joined, "政治阻力极大啊也不可能啊")
+
+    def test_two_ascii_words_get_one_half_width_space(self):
+        # Measured on p03 segments 2012 and 2013: `very good` followed by
+        # `Good` welds into `very goodGood` without one.
+        joined = videokit.transcript_text([segment("然后呢回答就very good"), segment("Good")])
+        self.assertEqual(joined, "然后呢回答就very good Good")
+
+    def test_digits_on_both_sides_get_one_space(self):
+        joined = videokit.transcript_text(
+            [segment("60616263646566676869"), segment("70707172737475767778")]
+        )
+        self.assertEqual(joined, "60616263646566676869 70707172737475767778")
+
+    def test_a_chinese_character_on_either_side_gets_no_space(self):
+        # 572 real boundaries run Chinese into ASCII and 324 run ASCII into
+        # Chinese. Neither takes a separator.
+        self.assertEqual(
+            videokit.transcript_text([segment("含金量定为0"), segment("克黄金啊")]),
+            "含金量定为0克黄金啊",
+        )
+        self.assertEqual(
+            videokit.transcript_text([segment("叫in the long on"), segment("斯有句名言")]),
+            "叫in the long on斯有句名言",
+        )
+
+    def test_a_punctuation_side_gets_no_space(self):
+        # Measured: `农业占比7%` followed by `然后呢这个第二就是第一产` reads
+        # correctly as one run. 315 real segments end in `%`.
+        self.assertEqual(
+            videokit.transcript_text([segment("农业占比7%"), segment("然后呢这个第二就是第一产")]),
+            "农业占比7%然后呢这个第二就是第一产",
+        )
+
+    def test_the_real_p12_slice_has_no_inserted_space(self):
+        # 55 real segments, 608 text characters, and every boundary carries a
+        # Chinese character on at least one side, so the output is the bare
+        # concatenation.
+        segments = videokit.parse_srt(SRT_P12)
+        joined = videokit.transcript_text(segments)
+        self.assertEqual(len(joined), 608)
+        self.assertEqual(joined, "".join(s.text for s in segments))
+
+    def test_the_real_p18_slice_gets_exactly_four_spaces(self):
+        # 9 real segments, 103 text characters, 4 boundaries with digits on
+        # both sides. 103 + 4 = 107.
+        joined = videokit.transcript_text(videokit.parse_srt(SRT_P18))
+        self.assertEqual(len(joined), 107)
+        self.assertIn(
+            "60616263646566676869 70707172737475767778 79808 1828 38485868687888990",
+            joined,
+        )
+
+    def test_keeps_adjacent_duplicate_segments(self):
+        # p12 segments 418 and 419 both read 也不可能啊. They are two different
+        # stretches of speech; deduplicating would drop a second of content.
+        joined = videokit.transcript_text(videokit.parse_srt(SRT_P12))
+        self.assertIn("也不可能啊也不可能啊", joined)
+
+    def test_the_delivered_text_carries_no_timestamp(self):
+        joined = videokit.transcript_text(videokit.parse_srt(SRT_P12))
+        self.assertNotIn("-->", joined)
+        self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", joined))
+        self.assertNotIn("835.719", joined)
+
+
+class PartJudgment(unittest.TestCase):
+    """Judging one part, per part rather than per video.
+
+    Each part is asked separately because the real course mixes the two states:
+    21 parts carry a track, 9 do not, and the state is uncorrelated with
+    length. A part with no track is recorded as awaiting ASR. That is not an
+    error, so nothing here raises.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+
+    def _part(self, index: int) -> videokit.Part:
+        return next(p for p in self.video.parts if p.index == index)
+
+    def test_a_part_with_a_track_is_assembled_from_its_segments(self):
+        record = videokit.part_transcript(self.video, self._part(18))
+        self.assertEqual(record.bvid, "BV1Y5QgB5Eas")
+        self.assertEqual(record.index, 18)
+        self.assertEqual(record.source, "platform")
+        self.assertEqual(record.language, "ai-zh")
+        self.assertEqual(record.status, "ok")
+        self.assertIsNone(record.failure_reason)
+        self.assertEqual(len(record.segments), 1078)
+        self.assertEqual(record.segments[0].text, "呃现在我们来进入到这个货币经济")
+
+    def test_the_record_carries_the_probe_metadata(self):
+        record = videokit.part_transcript(self.video, self._part(3))
+        self.assertEqual(record.index, 3)
+        self.assertIn("宏观经济数据和宏观逻辑的逻辑", record.title)
+        self.assertAlmostEqual(record.duration_sec, 5338.569, places=3)
+
+    def test_the_requested_language_is_the_one_the_probe_reported(self):
+        videokit.part_transcript(self.video, self._part(12))
+        args = self.calls[-1]
+        self.assertEqual(args[args.index("--sub-langs") + 1], "ai-zh")
+        self.assertEqual(args[args.index("--playlist-items") + 1], "12")
+
+    def test_a_part_without_a_track_is_recorded_as_awaiting_asr(self):
+        # Not an error and not a failure. It is a part waiting for the ASR
+        # path, and it must be tellable from one that already has a transcript.
+        record = videokit.part_transcript(self.video, self._part(1))
+        self.assertEqual(record.status, "pending")
+        self.assertIsNone(record.source)
+        self.assertIsNone(record.language)
+        self.assertEqual(record.segments, ())
+        self.assertEqual(record.index, 1)
+
+    def test_a_part_without_a_track_does_not_raise(self):
+        # An empty transcript written to disk looks finished, and a raised
+        # error would abort the batch. Neither is what "awaiting ASR" means,
+        # so the call returns a record instead.
+        record = videokit.part_transcript(self.video, self._part(6))
+        self.assertIsInstance(record, videokit.PartTranscript)
+
+    def test_no_fetch_is_attempted_for_a_part_without_a_track(self):
+        before = len(self.calls)
+        videokit.part_transcript(self.video, self._part(2))
+        self.assertEqual(len(self.calls), before)
+
+    def test_a_track_that_fails_to_arrive_is_also_recorded_as_pending(self):
+        # The probe table and the fetch can disagree, for instance once the
+        # login has gone stale. The outcome is the same: this part needs ASR.
+        def empty_track(args, cookies):
+            self.calls.append(args)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = empty_track
+        record = videokit.part_transcript(self.video, self._part(12))
+        self.assertEqual(record.status, "pending")
+        self.assertIsNone(record.source)
+
+    @unittest.skipUnless(
+        hasattr(videokit, "LoginRequired"),
+        "ticket #13 adds LoginRequired; this assertion starts biting once it lands",
+    )
+    def test_a_credential_problem_is_not_recorded_as_a_part_without_a_track(self):
+        # These two look alike from here and are opposite in remedy. A part
+        # with no track waits for ASR, which will always work. A stale login
+        # makes every part look empty, and running ASR over the whole course
+        # would be the wrong response to a credential that needs re-exporting.
+        def stale_login(args, cookies):
+            self.calls.append(args)
+            raise videokit.LoginRequired("login required")
+
+        videokit._run = stale_login
+        with self.assertRaises(videokit.LoginRequired):
+            videokit.part_transcript(self.video, self._part(12))
+
+
+class DeliverableFiles(unittest.TestCase):
+    """The file a reader opens, named so a directory listing reads in order."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _record(self, index: int, title: str, texts: list[str]) -> videokit.PartTranscript:
+        return videokit.PartTranscript(
+            bvid="BV1Y5QgB5Eas",
+            index=index,
+            title=title,
+            duration_sec=100.0,
+            source="platform",
+            language="ai-zh",
+            segments=tuple(segment(t) for t in texts),
+            status="ok",
+        )
+
+    def test_the_name_carries_the_index_and_the_title(self):
+        record = self._record(3, "03-宏观经济数据和宏观逻辑的逻辑-1", ["呃"])
+        path = videokit.write_transcript(record, self.out)
+        self.assertEqual(path.name, "03-03-宏观经济数据和宏观逻辑的逻辑-1.txt")
+
+    def test_the_file_holds_the_continuous_prose(self):
+        record = self._record(3, "t", ["政治阻力极大啊", "也不可能啊"])
+        path = videokit.write_transcript(record, self.out)
+        self.assertEqual(path.read_text(encoding="utf-8").strip(), "政治阻力极大啊也不可能啊")
+
+    def test_the_source_does_not_reach_the_file(self):
+        # `source` serves the program, the delivered file serves the reader.
+        # The accepted decision "use the subtitles as they are, no source
+        # marking and no quality grading" is about this file, so a record that
+        # keeps a source is not in tension with it.
+        record = self._record(3, "t", ["呃现在我们来进入到这个货币经济"])
+        delivered = videokit.write_transcript(record, self.out).read_text(encoding="utf-8")
+        self.assertNotIn("platform", delivered)
+        self.assertNotIn("asr", delivered)
+        self.assertNotIn("source", delivered)
+
+    def test_the_file_carries_no_timestamp(self):
+        record = self._record(3, "t", ["呃现在我们来进入到这个货币经济"])
+        delivered = videokit.write_transcript(record, self.out).read_text(encoding="utf-8")
+        self.assertNotIn("-->", delivered)
+        self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", delivered))
+        self.assertNotIn("0.0", delivered)
+
+    def test_the_output_directory_is_created_when_absent(self):
+        self.assertFalse(self.out.exists())
+        videokit.write_transcript(self._record(3, "t", ["呃"]), self.out)
+        self.assertTrue(self.out.is_dir())
+
+    def test_a_title_cannot_escape_the_output_directory(self):
+        # A title is external data, so a separator in it must not silently
+        # turn into a new directory. None of the 30 real titles carries one,
+        # which is why this is a guard rather than a repair.
+        record = self._record(3, "a/b", ["呃"])
+        path = videokit.write_transcript(record, self.out)
+        self.assertEqual(path.parent, self.out)
+
+
+class BatchRun(unittest.TestCase):
+    """One command, one BV number, every part judged, none of them fatal.
+
+    `_run` is the only stub, so probe and the per-part fetch run the real code
+    paths over recorded output.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_every_part_is_judged_and_the_twenty_one_with_tracks_are_delivered(self):
+        records = videokit.transcripts("https://www.bilibili.com/video/BV1Y5QgB5Eas", self.out)
+        self.assertEqual(len(records), 30)
+        delivered = [r for r in records if r.status == "ok"]
+        pending = [r for r in records if r.status == "pending"]
+        self.assertEqual(len(delivered), 21)
+        self.assertEqual(len(pending), 9)
+        self.assertEqual(tuple(r.index for r in pending), PARTS_WITHOUT_SUBTITLES)
+        self.assertEqual(tuple(r.index for r in delivered), PARTS_WITH_SUBTITLES)
+
+    def test_the_run_does_not_abort_on_the_leading_parts_without_tracks(self):
+        # Parts 1 and 2 come first and have no track. Stopping there would
+        # produce nothing at all.
+        records = videokit.transcripts("u", self.out)
+        self.assertEqual(records[-1].index, 30)
+        self.assertEqual(records[-1].status, "ok")
+
+    def test_a_file_is_written_for_each_delivered_part_and_no_other(self):
+        videokit.transcripts("u", self.out)
+        written = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual(len(written), 21)
+        self.assertEqual(written[0][:2], "03")
+        self.assertEqual(written[-1][:2], "30")
+        # The listing reads in part order, which is what the prefix is for.
+        self.assertEqual(written, sorted(written))
+
+    def test_the_delivered_files_read_as_continuous_prose(self):
+        videokit.transcripts("u", self.out)
+        for path in sorted(self.out.iterdir()):
+            with self.subTest(name=path.name):
+                delivered = path.read_text(encoding="utf-8")
+                self.assertTrue(delivered.strip())
+                self.assertNotIn("-->", delivered)
+                self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", delivered))
+                self.assertNotIn("platform", delivered)
+
+    def test_pending_parts_get_no_file(self):
+        videokit.transcripts("u", self.out)
+        names = {p.name for p in self.out.iterdir()}
+        for index in PARTS_WITHOUT_SUBTITLES:
+            with self.subTest(index=index):
+                self.assertFalse([n for n in names if n.startswith(f"{index:02d}-")])
+
+    def test_a_restricted_part_selection_judges_only_those_parts(self):
+        records = videokit.transcripts("u", self.out, parts=[1, 3])
+        self.assertEqual([r.index for r in records], [1, 3])
+        self.assertEqual([r.status for r in records], ["pending", "ok"])
+        self.assertEqual(len(list(self.out.iterdir())), 1)
+
+
+class TranscriptCommand(unittest.TestCase):
+    """One command, given a BV number, produces the delivered transcripts."""
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+        self.buffer = io.StringIO()
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_a_bv_number_is_enough_to_produce_the_transcripts(self):
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(list(self.out.iterdir())), 21)
+
+    def test_the_command_reports_the_parts_left_for_asr(self):
+        # The reader has to see which parts are missing and why, or the
+        # silence reads as success.
+        with contextlib.redirect_stdout(self.buffer):
+            videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+        printed = self.buffer.getvalue()
+        self.assertIn("21", printed)
+        self.assertIn("9", printed)
+        self.assertIn("ASR", printed)
+
+    def test_a_url_works_as_well_as_a_bare_bv_number(self):
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(
+                [
+                    "transcript",
+                    "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+                    "--out",
+                    str(self.out),
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("BV1Y5QgB5Eas", self.calls[0][-1])
+
+    def test_a_bare_bv_number_is_expanded_to_a_url(self):
+        # A BV number is what a user has in hand, and the extractor needs the
+        # URL. Nobody should have to paste the prefix.
+        with contextlib.redirect_stdout(self.buffer):
+            videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+        self.assertEqual(self.calls[0][-1], "https://www.bilibili.com/video/BV1Y5QgB5Eas")
+
+    def test_a_part_selection_can_be_named(self):
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(
+                ["transcript", "BV1Y5QgB5Eas", "--out", str(self.out), "--parts", "3,4"]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(list(self.out.iterdir())), 2)
+
+    def test_the_output_directory_can_be_omitted(self):
+        with contextlib.chdir(self.tmp):
+            with contextlib.redirect_stdout(self.buffer):
+                code = videokit.main(["transcript", "BV1Y5QgB5Eas"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(list((self.tmp / "transcripts").iterdir())), 21)
+
+    def test_a_missing_video_reference_is_refused_with_usage(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = videokit.main(["transcript"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("transcript", buffer.getvalue())
+
+    def test_an_unavailable_video_exits_nonzero_with_the_reason(self):
+        def failing(args, cookies):
+            raise videokit.VideoKitError("yt-dlp failed (exit 1): boom")
+
+        videokit._run = failing
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+        self.assertNotEqual(code, 0)
+        self.assertIn("boom", buffer.getvalue())
 
 
 if __name__ == "__main__":

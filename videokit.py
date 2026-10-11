@@ -34,6 +34,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterable
 
 # yt-dlp writes its subtitle table to stdout, not to JSON. This is a known
 # Bilibili extractor limitation (yt-dlp issue #17527): `subtitles` comes back
@@ -723,6 +724,233 @@ def probe(url: str, cookies: Path | None = None) -> Video:
     )
 
 
+@dataclass(frozen=True)
+class PartTranscript:
+    """One part's transcript, whichever source produced it.
+
+    Both sources land here so the delivered text does not depend on which one
+    was used. `source` is the only field that names the difference, and **it
+    never reaches the delivered file.** That separation is deliberate and it is
+    not a contradiction of the accepted decision "use the subtitles as they
+    are, no source marking and no quality grading": that decision is about the
+    file the reader opens. The program still needs to know, because a part
+    taken from a platform track and a part filled in by ASR carry different
+    timestamp granularity and different punctuation.
+
+    `status` has a third value beyond the spec's `ok` / `failed`. A part with
+    no subtitle track is neither: its transcript does not exist yet, and the
+    ASR path is expected to produce it. Recording that as `ok` would claim a
+    transcript that is not there, and recording it as `failed` with
+    `failure_reason = "no_audio"` would blame the audio, which is present.
+    `pending` is what is left, and the nine such parts of a 30-part course are
+    the reason the value exists.
+
+    `status` and `failure_reason` stay separate because the reason decides
+    whether a rerun can help. `no_audio` cannot be fixed by retrying;
+    `asr_error` can. Merged into one field, a caller cannot tell them apart.
+    This ticket produces no `failed` record. Ticket #18 owns that path.
+    """
+
+    bvid: str
+    index: int
+    title: str
+    duration_sec: float
+    source: str | None
+    language: str | None
+    segments: tuple[Segment, ...]
+    status: str
+    failure_reason: str | None = None
+
+
+def _needs_separator(left: str, right: str) -> bool:
+    """Whether a half-width space belongs between two segments.
+
+    Measured over all 21 recorded tracks, 40283 segments and 40262 adjacent
+    boundaries. Exactly 55 boundaries carry an ASCII alphanumeric character on
+    both sides, and gluing those welds two words together. The measured
+    example is p03 segments 2012 and 2013, `very good` followed by `Good`
+    becoming `very goodGood`. Nine more of the 55 are like p18 segments 366
+    and 367, where `60616263646566676869` runs into `70707172737475767778` as
+    one 39-digit run.
+
+    The other 40207 boundaries take no separator. 38994 of them sit between
+    two Chinese characters, so `" ".join` would insert 38994 spaces the source
+    does not have and break the text into pieces. A Chinese character on
+    either side therefore means no separator, and so does a punctuation mark:
+    315 segments end in `%`, and `农业占比7%` followed by `然后呢这个第二就是
+    第一产` reads correctly as one run.
+
+    The rule is measured, not chosen. Changing it means re-measuring these
+    four numbers.
+    """
+    if not left or not right:
+        return False
+    before, after = left[-1], right[0]
+    return before.isascii() and before.isalnum() and after.isascii() and after.isalnum()
+
+
+def transcript_text(segments: Iterable[Segment]) -> str:
+    """Join timed segments into the continuous prose that gets delivered.
+
+    No timestamp enters the result; the separators carry no information beyond
+    the one case `_needs_separator` describes.
+
+    Two properties of the source text show up here and are not defects.
+
+    There is no sentence punctuation anywhere in it. Measured over all 21
+    recorded tracks, 454245 text characters, the count of CJK sentence
+    punctuation is zero, as is the count of ASCII `, ? ! ;`. The delivered
+    text is one unbroken run, and paragraph boundaries would need a strategy
+    this ticket does not add.
+
+    Speaker repetition is preserved. 17 pairs of adjacent segments repeat
+    verbatim, for instance p12 segments 418 and 419, both `也不可能啊`. They
+    are two separate stretches of speech; the delivered text reads
+    `...政治阻力极大啊也不可能啊也不可能啊`. Removing one would drop about a
+    second of real content, so nothing is deduplicated.
+    """
+    pieces: list[str] = []
+    previous: Segment | None = None
+    for current in segments:
+        if previous is not None and _needs_separator(previous.text, current.text):
+            pieces.append(" ")
+        pieces.append(current.text)
+        previous = current
+    return "".join(pieces)
+
+
+def transcript_filename(record: PartTranscript) -> str:
+    """The delivered file's name, ordered by part.
+
+    The index prefix is what makes a directory listing read in course order,
+    because every title begins with the course name rather than with its own
+    number.
+
+    A title is external data, so characters that cannot appear in a Windows
+    file name are replaced. No real title needs this: measured over the 30
+    titles of the first target, zero carry one. It is a guard at a boundary,
+    not a repair.
+    """
+    unsafe = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+    title = unsafe.sub("_", record.title).strip().rstrip(".")
+    return f"{record.index:02d}-{title}.txt"
+
+
+def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
+    """Write one delivered transcript and return its path.
+
+    Plain text, UTF-8, no timestamps, no source marker, no quality grade. The
+    name carries the part index and title.
+
+    A `pending` record has no transcript to write. Writing an empty file for
+    one would look finished, which is the outcome `SubtitleUnavailable` exists
+    to prevent, so callers must not ask.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / transcript_filename(record)
+    path.write_text(transcript_text(record.segments), encoding="utf-8")
+    return path
+
+
+def _pending_record(bvid: str, part: Part) -> PartTranscript:
+    """The record for a part whose subtitles are missing, so ASR owes it one."""
+    return PartTranscript(
+        bvid=bvid,
+        index=part.index,
+        title=part.title,
+        duration_sec=part.duration_sec,
+        source=None,
+        language=None,
+        segments=(),
+        status="pending",
+    )
+
+
+def _preferred_language(part: Part) -> str:
+    """The track to take for a part that has more than one."""
+    for preferred in ("ai-zh", "zh-CN", "zh"):
+        if preferred in part.subtitle_langs:
+            return preferred
+    return part.subtitle_langs[0]
+
+
+def part_transcript(
+    video: Video,
+    part: Part,
+    cookies: Path | None = None,
+) -> PartTranscript:
+    """Judge one part and produce its transcript record.
+
+    The judgment is per part, never per video. Measured on the first real
+    target, 21 of 30 parts carry a track and 9 do not, and the state does not
+    follow part length, so a whole-video answer would be wrong for one group
+    or the other.
+
+    A part with no track returns a `pending` record rather than raising. An
+    exception here would abort the batch at part 1 of this course, and the
+    nine parts without a track are spread through the middle of it.
+
+    A credential fault is not the same thing and is not swallowed. Once the
+    login is stale every part reads as trackless, so treating that as
+    `pending` would hand the whole course to the ASR path in response to a
+    problem that re-exporting the credential fixes. Ticket #13 raises
+    `LoginRequired` for that, and it is deliberately not caught here, so it
+    travels up with its next-step message. `SubtitleUnavailable` is the only
+    outcome that means "this part needs ASR".
+    """
+    if not part.has_subtitles:
+        return _pending_record(video.id, part)
+    language = _preferred_language(part)
+    try:
+        segments = part_subtitles(video.id, part.index, language, cookies)
+    except SubtitleUnavailable:
+        # The probe table and the fetch can disagree, for instance if the
+        # track was withdrawn between the two calls. Either way this part
+        # still needs a transcript from somewhere, so it is pending.
+        return _pending_record(video.id, part)
+    return PartTranscript(
+        bvid=video.id,
+        index=part.index,
+        title=part.title,
+        duration_sec=part.duration_sec,
+        source="platform",
+        language=language,
+        segments=tuple(segments),
+        status="ok",
+    )
+
+
+def transcripts(
+    url: str,
+    out_dir: Path,
+    parts: list[int] | None = None,
+    cookies: Path | None = None,
+) -> tuple[PartTranscript, ...]:
+    """Judge every part of `url` and deliver a transcript for each one that has one.
+
+    Returns one record per part, in course order, whether or not a file was
+    written. Callers get the `pending` parts too, because "which parts still
+    need ASR" is the question the next ticket asks.
+
+    Processing does not stop at a part without subtitles. It does stop on a
+    credential fault, which is not a per-part condition: it makes every part
+    look trackless, so continuing would run the ASR path over the whole course
+    and produce a full set of transcripts from the wrong cause.
+    """
+    video = probe(url, cookies)
+    selected = [
+        part for part in video.parts if parts is None or part.index in parts
+    ]
+    records: list[PartTranscript] = []
+    for part in selected:
+        record = part_transcript(video, part, cookies)
+        if record.status == "ok":
+            write_transcript(record, out_dir)
+        records.append(record)
+    return tuple(records)
+
+
 def _format_selector(quality: str) -> str:
     """Map a quality name to a yt-dlp format expression.
 
@@ -821,20 +1049,65 @@ def download_audio(
     )
 
 
+def video_url(reference: str) -> str:
+    """Turn a bare BV number into the URL yt-dlp takes.
+
+    `BV1Y5QgB5Eas` is what a user has in hand, a URL is what the extractor
+    needs. Both are accepted so neither has to be converted by hand.
+    """
+    reference = reference.strip()
+    if reference.startswith(("http://", "https://")):
+        return reference
+    return f"https://www.bilibili.com/video/{reference}"
+
+
+def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
+    """The line printed after a batch, naming what was produced and what was not.
+
+    The `pending` count is the point of the line. Without it a short run looks
+    exactly like a complete one.
+    """
+    records = list(records)
+    delivered = [r for r in records if r.status == "ok"]
+    pending = [r for r in records if r.status == "pending"]
+    failed = [r for r in records if r.status == "failed"]
+    lines = [
+        f"delivered {len(delivered)} of {len(records)} parts to {out_dir}",
+    ]
+    if pending:
+        lines.append(
+            f"{len(pending)} parts await ASR "
+            f"(no subtitle track): {', '.join(str(r.index) for r in pending)}"
+        )
+    if failed:
+        lines.append(
+            "failed: "
+            + ", ".join(f"{r.index} ({r.failure_reason})" for r in failed)
+        )
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     """The credential command. Returns a process exit code.
 
-    Scope is deliberately one subcommand. The general CLI that exposes probe
-    and both downloads belongs to ticket #20; this exists because the scan has
-    to be reachable without importing the module.
+    Scope is deliberately two subcommands. `login` exists because the scan has
+    to be reachable without importing the module. `transcript` exists because
+    the ticket asks for one command that turns a BV number into delivered
+    transcripts. The general CLI that exposes probe and both downloads belongs
+    to ticket #20.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["transcript"]:
+        return _transcript_command(argv[1:])
     if argv[:1] != ["login"]:
         print(
-            "usage: videokit login\n\n"
+            "usage: videokit login\n"
+            "       videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]\n\n"
             "Log in to Bilibili once. Opens a browser window, and after the QR "
             "code is scanned it stores a credential file that probe and the "
-            "downloads then use automatically.",
+            "downloads then use automatically.\n\n"
+            "transcript judges every part of a video and writes one plain-text "
+            "transcript per part that has subtitles.",
             file=sys.stderr,
         )
         return 2
@@ -845,6 +1118,37 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"credential written to {path}")
     return 0
+
+
+def _transcript_command(rest: list[str]) -> int:
+    """`videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]`."""
+    reference = next((a for a in rest if not a.startswith("-")), None)
+    if reference is None:
+        print(
+            "usage: videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]",
+            file=sys.stderr,
+        )
+        return 2
+    out_dir = Path(_option(rest, "--out") or Path.cwd() / "transcripts")
+    selection = _option(rest, "--parts")
+    parts = [int(p) for p in selection.split(",")] if selection else None
+    try:
+        records = transcripts(video_url(reference), out_dir, parts)
+    except VideoKitError as exc:
+        print(f"transcript failed: {exc}", file=sys.stderr)
+        return 1
+    print(transcript_report(records, out_dir))
+    return 0
+
+
+def _option(args: list[str], name: str) -> str | None:
+    """The value of `name`, or None when it is absent."""
+    if name not in args:
+        return None
+    position = args.index(name)
+    if position + 1 >= len(args):
+        return None
+    return args[position + 1]
 
 
 if __name__ == "__main__":

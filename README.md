@@ -2,7 +2,7 @@
 
 B 站视频的探测与下载。给一个链接，先告诉你有多少讲、哪些有字幕、有哪些清晰度可选，再按你的选择把视频或音频下下来。
 
-转写（把无字幕的讲次跑成本地文稿）是同一子项目的另一块，不在本包内。
+有字幕的讲次可以直接产出交付文稿，一条命令跑完；无字幕的讲次记为待 ASR。本地语音识别本身是同一子项目的另一块，不在本包内。
 
 ## 它解决什么
 
@@ -18,6 +18,12 @@ probe(url, cookies=None) -> Video
 
 part_subtitles(url, part, language="ai-zh", cookies=None) -> list[Segment]
     取回并解析某一讲的平台字幕轨。无字幕轨时抛 SubtitleUnavailable。
+
+transcript_text(segments) -> str
+    把分段拼成交付文稿的连续正文。分隔规则见「交付文稿」。
+
+transcripts(url, out_dir, parts=None, cookies=None) -> tuple[PartTranscript, ...]
+    一条命令跑完。逐讲判定，有字幕的写出交付文件，无字幕的记为待 ASR。
 
 download_video(url, out_dir, parts=None, quality="720p", cookies=None) -> list[Path]
     下视频。自动合并分开的音视频流。
@@ -100,6 +106,92 @@ for segment in videokit.part_subtitles(url, part=12):
 所以改用 `--print "%(requested_subtitles)j"`，字幕文本本身就在这个 JSON 里。**实测这份文本与 `yt-dlp` 写出的文件逐字节相同**，p12 两边 sha256 都是 `b13447822d78f2a02fe39101a66c5b17283602fdeca82c96725e0557f224c24c`，123777 字节。同时因为 `--print` 自带 `--simulate` 语义，磁盘上不会落文件，也就没有文件名编码问题。
 
 这个载荷是纯 ASCII 的，中文被转义成 `\uXXXX`。这一点在本包里很重要，`_run` 有意按控制台代码页解码子进程输出，转义载荷不受影响。
+
+## 交付文稿
+
+一条命令，给一个 BV 号，逐讲判定并产出所有有字幕讲次的纯文本文稿。
+
+```
+uv run --python 3.12 python videokit.py transcript BV1Y5QgB5Eas --out transcripts
+uv run --python 3.12 python videokit.py transcript https://www.bilibili.com/video/BV1Y5QgB5Eas --parts 3,4
+```
+
+从 Python 里调用是同一件事。
+
+```python
+records = videokit.transcripts("BV1Y5QgB5Eas", Path("transcripts"))
+```
+
+`parts` 是 `--parts` / 列表，省略表示全部讲次。`out_dir` / `--out` 省略时落在当前目录的 `transcripts/`。
+
+交付文件名带讲次序号与标题，所以目录列表按课程顺序读。
+
+```
+03-【徐高2025年宏观课】中国宏观经济 p03 02-宏观经济数据和宏观逻辑的逻辑-1.txt
+```
+
+### `source` 只服务程序，不进交付文稿
+
+**这一条必须写清楚，否则后来者会认为规格自相矛盾。**
+
+使用者已定「字幕直接用，不做来源标记，不做质量分级」，规格 Out of Scope 里也写了「交付文稿不做来源区分，不做质量打分」。而中间产物 `PartTranscript` 有 `source` 字段。两处并不冲突，因为它们说的是两层不同的东西。
+
+- **中间产物是给程序的。** 它要区分这一讲的正文从哪来，因为两条来源的时间戳粒度不同（平台字幕逐句，语音识别可到词级），标点风格也不同。代码里用得上，所以要留着。
+- **交付文稿是给读者的。** 读者要的是能读的正文，来源标记与质量分级对他只是噪声，所以一律不写。
+
+所以 `write_transcript` 只写 `transcript_text(record.segments)` 的结果，`source`、`language`、`status`、`failure_reason` 与任何时间戳都不进文件。测试 `DeliverableFiles.test_the_source_does_not_reach_the_file` 锁着这条。
+
+### 逐讲判定，不按整条视频二选一
+
+实测 `BV1Y5QgB5Eas` 21 讲有字幕、9 讲没有，且缺失的讲次夹在中间，第 1、2 讲就没有。所以判定逐讲做，且**无字幕的讲次不中止整批**。
+
+无字幕的讲次在返回的记录里是 `status = "pending"`，`source` 与 `language` 为 `None`，`segments` 为空，**不写文件**。这一讲等着后面的 ASR 路径补齐。
+
+**`pending` 是规格那三个取值之外的第三个。** 它既不是 `ok` 也不是 `failed`。记成 `ok` 会宣称一份并不存在的文稿；记成 `failed` 配上 `failure_reason = "no_audio"` 会冤枉音轨，音轨本身是好的。所以单独一个值。
+
+命令结尾打印一行汇总，包含产出了几讲、还剩几讲待 ASR 以及它们的序号。没有这一行，一次不完整的跑看起来和完整的一样。
+
+### 平台字幕无标点，这一条落在交付文稿里
+
+交付文稿会是一整条没有句号的连续流，段落划分要靠另加策略，本包不做。这是上游数据的样子，见「无标点是已接受的取舍」。
+
+同一门课将来的 ASR 讲次会有标点，两种风格会在交付文稿里混着。这一取舍与补救路径（把平台字幕也过一遍标点恢复，代价是重算原有时间戳）记在规格 #10 与 #17。
+
+### 拼接规则是量出来的，不是选的
+
+**朴素 `"".join` 会把 55 个位置的词粘在一起，`" ".join` 会插入 38994 个原文没有的空格。** 两个都不能用。
+
+实测 21 份真实字幕轨，共 40283 个分段、40262 个相邻边界，按两侧字符分类。
+
+| 前段末 | 后段首 | 个数 | 分隔符 |
+|---|---|---|---|
+| 汉字 | 汉字 | 38994 | 无 |
+| 汉字 | ASCII 字母数字 | 572 | 无 |
+| ASCII 字母数字 | 汉字 | 324 | 无 |
+| 标点或符号 | 汉字 | 294 | 无 |
+| **ASCII 字母数字** | **ASCII 字母数字** | **55** | **一个半角空格** |
+| 标点或符号 | ASCII 字母数字 | 23 | 无 |
+
+规则因此是**两侧都是 ASCII 字母数字时插入一个半角空格，其余零分隔符**。55 处的真实例子。
+
+| 前段尾部 | 后段头部 | 不插空格的后果 |
+|---|---|---|
+| `然后呢回答就very good` | `Good` | `very goodGood` |
+| `60616263646566676869` | `70707172737475767778` | 两串数字连成 39 位 |
+
+反面例子也要记。`农业占比7%` 后面接 `然后呢这个第二就是第一产`，`%` 不是字母数字，所以不插空格，拼出来读着正常。这类分段有 315 个。
+
+这条规则写在 `_needs_separator`，改动它就要把这四个数字重新量一遍。
+
+### 不去重，也不修上游的浮点泄漏
+
+相邻重复分段 17 对原样保留，例如 p12 第 418 与 419 段都是 `也不可能啊`，交付文稿里读作 `...政治阻力极大啊也不可能啊也不可能啊`。它们是两段不同时段的真实内容，删掉任一段会丢一秒左右的话。
+
+`大概只有三十六三十六.8000000000000` 这类浮点泄漏也原样进入文稿。那是 B 站自己的 ASR 流水线把 `float` 的 `repr` 写进了字幕，属于上游数据。
+
+### 交付文稿不含时间戳
+
+`Segment` 的 `start_sec` / `end_sec` 是独立字段，`transcript_text` 只用 `text`。测试同时断言交付内容里没有 `-->`、没有 `HH:MM:SS`、也没有秒数的小数写法。
 
 ## 登录态
 
@@ -191,7 +283,22 @@ Segment
   start_sec       分段起始秒，浮点
   end_sec         分段结束秒，浮点
   text            该段正文，不含时间戳，不含标点
+
+PartTranscript
+  bvid            如 BV1Y5QgB5Eas
+  index           讲次序号，从 1 起
+  title           讲次标题
+  duration_sec    秒
+  source          "platform" | "asr" | None。中间产物用，不进交付文稿
+  language        "ai-zh" | "zh" | None
+  segments        Segment 元组
+  status          "ok" | "pending" | "failed"
+  failure_reason  None | "no_audio" | "asr_error"
 ```
+
+`source` 与交付文稿的分层见「`source` 只服务程序，不进交付文稿」。
+
+`status` 与 `failure_reason` 分开，因为失败原因决定重跑策略。`no_audio` 重试多少次都不会成功，`asr_error` 可以重试。混成一个字段，调用方就无从判断该重试还是放弃。本票不产出 `failed` 记录，那条路径属于 #18。
 
 `Part.has_subtitles` 是判断有没有字幕的入口，不要直接看 `subtitle_langs` 是否非空以外的条件。
 
@@ -226,6 +333,14 @@ Segment
 
 **`_format_selector` 把清晰度名字映射到格式编号。** B 站不提供合流的流，选择器要同时指名一路视频和一路音频。
 
+**转文稿这一层是纯函数加一个循环。** `_needs_separator` 与 `transcript_text` 是纯函数，吃 `Segment` 列表出字符串；`transcript_filename` 与 `write_transcript` 碰文件系统；`part_transcript` 判定一讲；`transcripts` 遍历全部讲次并在有字幕的讲次上落文件。
+
+`_preferred_language` 在 `ai-zh`、`zh-CN`、`zh` 里按序取第一个存在的。这 21 讲只有 `ai-zh`，但入口收的是 `Part.subtitle_langs`，不该假定只有一个。
+
+`video_url` 把裸 BV 号补成 URL，两者都收，使用者不用自己拼前缀。
+
+**凭据问题与「这一讲没字幕」必须分开。** `part_transcript` 只捕获 `SubtitleUnavailable`，那是「这一讲要 ASR」。登录失效时每一讲都表现为无字幕轨，若把它也记成待 ASR，整门课会被交给 ASR 路径，而真正的补救动作是重新导出一次凭据。#13 为这种情况抛 `LoginRequired`，这里有意不接，让它带着下一步提示往上走。
+
 ## 下载的两处硬约束
 
 **路径来自 `yt-dlp` 的报告，不是猜文件名。** 用的是 `--print after_move:filepath`。输出模板里有 `%(...)s` 占位符，且后处理（合并、抽音频）会改扩展名，所以磁盘上的名字无法从模板推出来。
@@ -238,7 +353,7 @@ Segment
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-74 项断言，约 3.6 秒，不联网、不需要登录态。
+113 项断言，约 5 秒，不联网、不需要登录态。
 
 跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
@@ -264,13 +379,24 @@ CDP 那一层替换的是 WebSocket 对象。`cdp_cookies(ws)` 收一个已连�
 
 命令行入口也有断言，覆盖成功、未知子命令被拒、失败时非零退出并指出环节。
 
-**真实端到端另有一个手工脚本，不进测试套件。**
+### 交付文稿这一层
+
+`transcript_text` 直接吃 `Segment` 值，不碰 `_run`，所以分隔规则可以逐条钉死。期望值来自实测数字与手读夹具。
+
+- **`_needs_separator` / `transcript_text` 用构造的 `Segment`。** 每个方向一条断言，含汉字邻接、ASCII 邻接、数字邻接、`%` 结尾，以及真实切片两份。p12 那 55 段 608 字符一个空格都不插，p18 那 9 段 103 字符插 4 个，出 107。
+- **`part_transcript` 替换 `_run`。** 替身按讲次回放有轨与无轨两种真实回包，所以「有轨的组装成结构」与「无轨的记为待 ASR」都在真实字节上走。
+- **`transcripts` 与 `transcript` 子命令替换 `_run`，文件系统是真的。** 断言 30 讲全部被判定、21 讲落文件 9 讲不落、文件名按序、文件内容是连续正文。
+
+`subtitle-print-part.txt` 本来是 p18 的回包，测试里被当成「有轨」讲次的通用回包，所以那些讲次都得到 p18 的 1078 段。判定与产物的形状因此可断言，讲次之间不串味。
+
+**真实端到端另有两个手工脚本，不进测试套件。**
 
 ```
 uv run --python 3.12 python test/_live_subtitles.py
+uv run --python 3.12 python videokit.py transcript BV1Y5QgB5Eas --out transcripts
 ```
 
-它会联网、用真实凭据，取回 4 讲的字幕并与实测分段数逐个对照，再验一次「无轨抛异常」与「空输入返回空列表」的区分。跑之前不要设 `PYTHONIOENCODING`。
+前一个联网、用真实凭据，取回 4 讲的字幕并与实测分段数逐个对照，再验一次「无轨抛异常」与「空输入返回空列表」的区分。后一个是交付路径的真实端到端，实测约数分钟，产出 21 个文件。跑之前不要设 `PYTHONIOENCODING`。
 
 ## 已知限制
 
