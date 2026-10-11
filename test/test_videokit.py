@@ -1119,6 +1119,14 @@ class SubtitleRetrieval(unittest.TestCase):
 PARTS_WITH_SUBTITLES = (3, 4, 5, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 29, 30)
 PARTS_WITHOUT_SUBTITLES = (1, 2, 6, 7, 8, 9, 13, 23, 28)
 
+# The fields of `PartTranscript`, written out as a literal. Both sources must
+# produce exactly these, so "the same structure" is asserted against a known
+# list rather than against the other record, which would pass by construction.
+MODEL_FIELDS = (
+    "bvid", "duration_sec", "failure_reason", "index",
+    "language", "segments", "source", "status", "title",
+)
+
 
 def segment(text: str) -> videokit.Segment:
     """A segment carrying only the text under test."""
@@ -1240,6 +1248,11 @@ class PartJudgment(unittest.TestCase):
         self.original = videokit._run
         self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
         self.addCleanup(self._cleanup)
+        self.audio = self.tmp / "audio"
+        # The ASR engine is the second seam. It is injected here because a part
+        # with no track now completes itself from its audio, and the real
+        # engine costs 29 to 50 seconds to load.
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
 
         def fake_run(args, cookies):
             self.calls.append(args)
@@ -1248,6 +1261,8 @@ class PartJudgment(unittest.TestCase):
             if "--list-subs" in args:
                 return stub_run(MULTI_SUBS)
             part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / f"{part:02d}.wav"))
             if part in PARTS_WITH_SUBTITLES:
                 return stub_run(SUB_PRINT_PART)
             return stub_run(SUB_PRINT_NO_TRACK)
@@ -1263,6 +1278,12 @@ class PartJudgment(unittest.TestCase):
 
     def _part(self, index: int) -> videokit.Part:
         return next(p for p in self.video.parts if p.index == index)
+
+    def _transcript(self, index: int) -> videokit.PartTranscript:
+        """One part through the real judgment, with the audio step stubbed."""
+        return videokit.part_transcript(
+            self.video, self._part(index), engine=self.engine, audio_dir=self.audio
+        )
 
     def test_a_part_with_a_track_is_assembled_from_its_segments(self):
         record = videokit.part_transcript(self.video, self._part(18))
@@ -1297,47 +1318,139 @@ class PartJudgment(unittest.TestCase):
             self.calls[-1][-1], "https://www.bilibili.com/video/BV1Y5QgB5Eas"
         )
 
-    def test_a_part_without_a_track_is_recorded_as_awaiting_asr(self):
-        # Not an error and not a failure. It is a part waiting for the ASR
-        # path, and it must be tellable from one that already has a transcript.
-        record = videokit.part_transcript(self.video, self._part(1))
-        self.assertEqual(record.status, "pending")
-        self.assertIsNone(record.source)
-        self.assertIsNone(record.language)
-        self.assertEqual(record.segments, ())
+    def test_a_part_without_a_track_is_completed_by_asr(self):
+        # The join this ticket exists for. A part the probe says has no track
+        # is no longer left waiting; it is transcribed from its own audio in
+        # the same call, with no second command.
+        record = self._transcript(1)
+        self.assertEqual(record.status, "ok")
+        self.assertEqual(record.source, "asr")
+        self.assertEqual(record.language, "zh")
         self.assertEqual(record.index, 1)
+        self.assertIsNone(record.failure_reason)
+        self.assertEqual(len(record.segments), ASR_SEGMENTS)
+
+    def test_both_sources_land_in_the_same_structure(self):
+        # Only `source` differs. Every other field is filled either way, so a
+        # caller cannot tell the two apart by shape.
+        platform = videokit.part_transcript(self.video, self._part(3))
+        asr = self._transcript(6)
+        self.assertEqual(platform.source, "platform")
+        self.assertEqual(asr.source, "asr")
+        for record in (platform, asr):
+            with self.subTest(source=record.source):
+                self.assertIsInstance(record, videokit.PartTranscript)
+                self.assertEqual(record.bvid, "BV1Y5QgB5Eas")
+                self.assertEqual(record.status, "ok")
+                self.assertIsNone(record.failure_reason)
+                self.assertTrue(record.segments)
+                self.assertTrue(all(isinstance(s, videokit.Segment) for s in record.segments))
+                self.assertTrue(record.title)
+                self.assertGreater(record.duration_sec, 0)
+        # The field sets are identical, which is what "same structure" means.
+        # Asserted against a literal rather than against the sibling record, so
+        # a field added to the dataclass fails here instead of passing by
+        # construction.
+        self.assertEqual(tuple(sorted(platform.__dataclass_fields__)), MODEL_FIELDS)
+        self.assertEqual(tuple(sorted(asr.__dataclass_fields__)), MODEL_FIELDS)
+
+    def test_the_two_sources_carry_the_same_text_shape(self):
+        # Both paths deliver prose with no timestamp in it. The ASR side has
+        # punctuation and the platform side does not, and that difference is
+        # accepted rather than repaired.
+        platform_text = videokit.transcript_text(
+            videokit.part_transcript(self.video, self._part(3)).segments
+        )
+        asr_text = videokit.transcript_text(self._transcript(6).segments)
+        for prose in (platform_text, asr_text):
+            with self.subTest(head=prose[:12]):
+                self.assertTrue(prose.strip())
+                self.assertNotIn("-->", prose)
+                self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", prose))
+        self.assertEqual(re.search(r"[，。]", platform_text), None)
+        self.assertIsNotNone(re.search(r"[，。]", asr_text))
+
+    def test_the_audio_for_the_missing_part_is_downloaded_at_16k_mono(self):
+        # Not re-downloaded by hand and not converted later: `download_audio`
+        # is the step that produces the WAV the engine wants.
+        self._transcript(28)
+        audio_calls = [args for args in self.calls if "--audio-format" in args]
+        self.assertEqual(len(audio_calls), 1)
+        self.assertEqual(audio_calls[0][audio_calls[0].index("--playlist-items") + 1], "28")
+        self.assertEqual(
+            audio_calls[0][audio_calls[0].index("--postprocessor-args") + 1],
+            "-ar 16000 -ac 1",
+        )
+
+    def test_no_audio_is_downloaded_for_a_part_that_has_a_track(self):
+        self._transcript(18)
+        self.assertEqual([args for args in self.calls if "--audio-format" in args], [])
+
+    def test_the_engine_receives_the_downloaded_audio(self):
+        self._transcript(2)
+        self.assertEqual(len(self.engine.calls), 1)
+        self.assertEqual(self.engine.calls[0]["input"], str(self.audio / "02.wav"))
+
+    def test_an_engine_that_is_already_loaded_is_reused_rather_than_rebuilt(self):
+        # Loading costs 29 to 50 seconds, so one batch loads once. The engine
+        # arrives through the argument for exactly this reason.
+        loads = []
+        original = videokit.load_engine
+        videokit.load_engine = lambda device="cpu": loads.append(device) or self.engine
+        self.addCleanup(setattr, videokit, "load_engine", original)
+        for index in (1, 2, 6):
+            videokit.part_transcript(
+                self.video, self._part(index), engine=self.engine, audio_dir=self.audio
+            )
+        self.assertEqual(loads, [])
+
+    def test_a_part_with_a_track_never_reaches_the_engine(self):
+        self._transcript(3)
+        self.assertEqual(self.engine.calls, [])
 
     def test_a_part_without_a_track_does_not_raise(self):
         # An empty transcript written to disk looks finished, and a raised
-        # error would abort the batch. Neither is what "awaiting ASR" means,
-        # so the call returns a record instead.
-        record = videokit.part_transcript(self.video, self._part(6))
+        # error would abort the batch. Neither is what a part without a track
+        # means, so the call returns a record instead.
+        record = self._transcript(6)
         self.assertIsInstance(record, videokit.PartTranscript)
 
-    def test_no_fetch_is_attempted_for_a_part_without_a_track(self):
+    def test_an_audio_file_already_on_disk_is_not_downloaded_again(self):
+        # The nine audio files of the first target were fetched once and are
+        # still there. Re-fetching them for a rerun would cost the download
+        # time for files that already exist.
+        marker = self.audio / "06.wav"
+        self.audio.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"RIFF")
         before = len(self.calls)
-        videokit.part_transcript(self.video, self._part(2))
-        self.assertEqual(len(self.calls), before)
+        self._transcript(6)
+        self.assertEqual([a for a in self.calls[before:] if "--audio-format" in a], [])
 
-    def test_a_track_that_fails_to_arrive_is_also_recorded_as_pending(self):
-        # The probe table and the fetch can disagree, for instance once the
-        # login has gone stale. The outcome is the same: this part needs ASR.
+    def test_a_track_that_fails_to_arrive_is_also_completed_by_asr(self):
+        # The probe table and the fetch can disagree, for instance if the
+        # track was withdrawn between the two calls. The outcome is the same:
+        # this part needs a transcript from somewhere, and ASR is that.
         def empty_track(args, cookies):
             self.calls.append(args)
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / "12.wav"))
             return stub_run(SUB_PRINT_NO_TRACK)
 
         videokit._run = empty_track
-        record = videokit.part_transcript(self.video, self._part(12))
-        self.assertEqual(record.status, "pending")
-        self.assertIsNone(record.source)
+        record = videokit.part_transcript(
+            self.video, self._part(12), engine=self.engine, audio_dir=self.audio
+        )
+        self.assertEqual(record.status, "ok")
+        self.assertEqual(record.source, "asr")
 
-    def test_a_credential_problem_is_not_recorded_as_a_part_without_a_track(self):
+    def test_a_credential_problem_is_not_swallowed_into_a_transcript(self):
         # The two look alike from inside this method and are opposite in
         # remedy. A part with no track waits for ASR, which will always work.
-        # A stale login makes every part read as trackless, so recording that
-        # as `pending` would hand the whole 30-part course to the ASR path in
-        # response to a problem that re-exporting the credential fixes.
-        # `probe` is what sees the warning first, and it refuses there.
+        # A stale login makes every part read as trackless, so treating that
+        # as "transcribe it" would hand the whole 30-part course to the ASR
+        # path, and cost about 39 minutes, in response to a problem that
+        # re-exporting the credential fixes. `probe` is what sees the warning
+        # first, and it refuses there.
         def logged_out(args, cookies):
             self.calls.append(args)
             if "--dump-single-json" in args:
@@ -1351,7 +1464,7 @@ class PartJudgment(unittest.TestCase):
     def test_a_stale_login_reaches_the_batch_from_the_fetch_too(self):
         # The probe table says part 12 has a track and the fetch disagrees
         # because the login went stale between the two calls. That is not a
-        # part needing ASR either, so it must not be written as `pending`.
+        # part needing ASR either, so it must not be silently transcribed.
         def stale_on_fetch(args, cookies):
             self.calls.append(args)
             if "--dump-single-json" in args:
@@ -1435,13 +1548,18 @@ class DeliverableFiles(unittest.TestCase):
 class BatchRun(unittest.TestCase):
     """One command, one BV number, every part judged, none of them fatal.
 
-    `_run` is the only stub, so probe and the per-part fetch run the real code
-    paths over recorded output.
+    `_run` and the ASR engine are the only stubs, so probe, the per-part fetch
+    and the per-part audio download run the real code paths over recorded
+    output. A part with no track is completed from its audio in the same pass,
+    which is the join this ticket adds.
     """
 
     def setUp(self):
         self.calls: list[list[str]] = []
         self.original = videokit._run
+        self.original_engine = videokit.load_engine
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
+        self.loads: list[str] = []
 
         def fake_run(args, cookies):
             self.calls.append(args)
@@ -1450,49 +1568,80 @@ class BatchRun(unittest.TestCase):
             if "--list-subs" in args:
                 return stub_run(MULTI_SUBS)
             part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / f"{part:02d}.wav"))
             if part in PARTS_WITH_SUBTITLES:
                 return stub_run(SUB_PRINT_PART)
             return stub_run(SUB_PRINT_NO_TRACK)
 
         videokit._run = fake_run
+        # The engine is handed over instead of built, so `transcripts` must
+        # accept one. Counting the loads is how a per-part reload is caught.
+        videokit.load_engine = lambda device="cpu": self.loads.append(device) or self.engine
         self.addCleanup(setattr, videokit, "_run", self.original)
+        self.addCleanup(setattr, videokit, "load_engine", self.original_engine)
         self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
         self.addCleanup(self._cleanup)
         self.out = self.tmp / "transcripts"
+        self.audio = self.tmp / "audio"
 
     def _cleanup(self):
         for child in sorted(self.tmp.rglob("*"), reverse=True):
             child.unlink() if child.is_file() else child.rmdir()
         self.tmp.rmdir()
 
-    def test_every_part_is_judged_and_the_twenty_one_with_tracks_are_delivered(self):
-        records = videokit.transcripts("https://www.bilibili.com/video/BV1Y5QgB5Eas", self.out)
+    def _run_all(self, parts: list[int] | None = None):
+        # No engine is passed in on purpose, so the loading policy itself is
+        # what runs here: build it on the first part that needs it, and reuse
+        # it for every part after that.
+        return videokit.transcripts(
+            "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+            self.out,
+            parts=parts,
+            audio_dir=self.audio,
+        )
+
+    def test_all_thirty_parts_are_delivered(self):
+        records = self._run_all()
         self.assertEqual(len(records), 30)
-        delivered = [r for r in records if r.status == "ok"]
-        pending = [r for r in records if r.status == "pending"]
-        self.assertEqual(len(delivered), 21)
-        self.assertEqual(len(pending), 9)
-        self.assertEqual(tuple(r.index for r in pending), PARTS_WITHOUT_SUBTITLES)
-        self.assertEqual(tuple(r.index for r in delivered), PARTS_WITH_SUBTITLES)
-
-    def test_the_run_does_not_abort_on_the_leading_parts_without_tracks(self):
-        # Parts 1 and 2 come first and have no track. Stopping there would
-        # produce nothing at all.
-        records = videokit.transcripts("u", self.out)
-        self.assertEqual(records[-1].index, 30)
-        self.assertEqual(records[-1].status, "ok")
-
-    def test_a_file_is_written_for_each_delivered_part_and_no_other(self):
-        videokit.transcripts("u", self.out)
+        self.assertEqual([r.index for r in records], list(range(1, 31)))
+        self.assertEqual([r for r in records if r.status != "ok"], [])
         written = sorted(p.name for p in self.out.iterdir())
-        self.assertEqual(len(written), 21)
-        self.assertEqual(written[0][:2], "03")
+        self.assertEqual(len(written), 30)
+        self.assertEqual(written[0][:2], "01")
         self.assertEqual(written[-1][:2], "30")
         # The listing reads in part order, which is what the prefix is for.
         self.assertEqual(written, sorted(written))
 
-    def test_the_delivered_files_read_as_continuous_prose(self):
-        videokit.transcripts("u", self.out)
+    def test_the_two_sources_split_twenty_one_and_nine(self):
+        records = self._run_all()
+        platform = [r for r in records if r.source == "platform"]
+        asr = [r for r in records if r.source == "asr"]
+        self.assertEqual(len(platform), 21)
+        self.assertEqual(len(asr), 9)
+        self.assertEqual(tuple(r.index for r in platform), PARTS_WITH_SUBTITLES)
+        self.assertEqual(tuple(r.index for r in asr), PARTS_WITHOUT_SUBTITLES)
+        self.assertEqual(
+            [r.language for r in platform], ["ai-zh"] * 21
+        )
+        self.assertEqual([r.language for r in asr], ["zh"] * 9)
+
+    def test_the_engine_is_loaded_once_for_the_whole_batch(self):
+        # 29 to 50 seconds per load. Over 30 parts a per-part load would add
+        # about 20 minutes to a batch that is already 40 minutes of compute.
+        self._run_all()
+        self.assertEqual(self.loads, ["cpu"])
+        self.assertEqual(len(self.engine.calls), 9)
+
+    def test_the_run_does_not_abort_on_the_leading_parts_without_tracks(self):
+        # Parts 1 and 2 come first and have no track. Stopping there would
+        # produce nothing at all.
+        records = self._run_all()
+        self.assertEqual(records[-1].index, 30)
+        self.assertEqual(records[-1].status, "ok")
+
+    def test_every_delivered_file_reads_as_prose_with_no_source_marker(self):
+        self._run_all()
         for path in sorted(self.out.iterdir()):
             with self.subTest(name=path.name):
                 delivered = path.read_text(encoding="utf-8")
@@ -1500,27 +1649,96 @@ class BatchRun(unittest.TestCase):
                 self.assertNotIn("-->", delivered)
                 self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", delivered))
                 self.assertNotIn("platform", delivered)
+                self.assertNotIn("asr", delivered)
 
-    def test_pending_parts_get_no_file(self):
-        videokit.transcripts("u", self.out)
-        names = {p.name for p in self.out.iterdir()}
-        for index in PARTS_WITHOUT_SUBTITLES:
-            with self.subTest(index=index):
-                self.assertFalse([n for n in names if n.startswith(f"{index:02d}-")])
+    def test_the_batch_accepts_a_bare_bv_number_like_the_documented_call(self):
+        # The README documents `transcripts("BV1Y5QgB5Eas", ...)`, and a real
+        # run of it failed with `'BV1Y5QgB5Eas' is not a valid URL`. The CLI
+        # was already normalizing through `video_url`, so only the library
+        # entry point was affected. Commit 72333ef fixed the same class of bug
+        # for the per-part subtitle fetch.
+        videokit.transcripts("BV1Y5QgB5Eas", self.out, parts=[3], audio_dir=self.audio)
+        self.assertEqual(
+            self.calls[0][-1], "https://www.bilibili.com/video/BV1Y5QgB5Eas"
+        )
+
+    def test_every_entry_point_normalizes_the_reference_the_same_way(self):
+        for reference in (
+            "BV1Y5QgB5Eas",
+            "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+        ):
+            with self.subTest(reference=reference):
+                self.assertEqual(
+                    videokit.video_url(reference),
+                    "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+                )
 
     def test_a_restricted_part_selection_judges_only_those_parts(self):
-        records = videokit.transcripts("u", self.out, parts=[1, 3])
+        records = self._run_all(parts=[1, 3])
         self.assertEqual([r.index for r in records], [1, 3])
+        self.assertEqual([r.status for r in records], ["ok", "ok"])
+        self.assertEqual([r.source for r in records], ["asr", "platform"])
+        self.assertEqual(len(list(self.out.iterdir())), 2)
+
+    def test_a_part_whose_audio_cannot_be_fetched_is_left_for_ticket_18(self):
+        # Ticket #18 owns failure recording. This asserts the room it will use:
+        # no audio means no transcript, the part is not written as `ok`, and
+        # the batch carries on. #18 turns this into `failed` with
+        # `failure_reason = "no_audio"`, the value that says retrying is
+        # pointless. `transcribe` must not be reached, because there is no file.
+        def no_audio(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run("")
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = no_audio
+        records = self._run_all(parts=[1, 3])
         self.assertEqual([r.status for r in records], ["pending", "ok"])
-        self.assertEqual(len(list(self.out.iterdir())), 1)
+        self.assertIsNone(records[0].source)
+        self.assertEqual(records[0].segments, ())
+        self.assertEqual(self.engine.calls, [])
+        self.assertEqual(
+            [p.name[:2] for p in sorted(self.out.iterdir())], ["03"]
+        )
+
+    def test_a_batch_with_nothing_to_transcribe_never_loads_the_engine(self):
+        # A course whose every part has a track must not pay 30 seconds for a
+        # model it will not use.
+        records = self._run_all(parts=[3, 4])
+        self.assertEqual(self.loads, [])
+        self.assertEqual([r.source for r in records], ["platform", "platform"])
+
+    def test_the_audio_is_fetched_once_per_missing_part_on_a_first_run(self):
+        self._run_all()
+        audio_calls = [a for a in self.calls if "--audio-format" in a]
+        self.assertEqual(len(audio_calls), 9)
+        indexes = sorted(
+            int(a[a.index("--playlist-items") + 1]) for a in audio_calls
+        )
+        self.assertEqual(indexes, list(PARTS_WITHOUT_SUBTITLES))
 
 
 class TranscriptCommand(unittest.TestCase):
-    """One command, given a BV number, produces the delivered transcripts."""
+    """One command, given a BV number, produces the delivered transcripts.
+
+    One command covers both sources. A part without a track is filled from its
+    audio in the same run, so there is no second command to remember.
+    """
 
     def setUp(self):
         self.calls: list[list[str]] = []
         self.original = videokit._run
+        self.original_engine = videokit.load_engine
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
+        self.loads: list[str] = []
 
         def fake_run(args, cookies):
             self.calls.append(args)
@@ -1529,16 +1747,29 @@ class TranscriptCommand(unittest.TestCase):
             if "--list-subs" in args:
                 return stub_run(MULTI_SUBS)
             part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / f"{part:02d}.wav"))
             if part in PARTS_WITH_SUBTITLES:
                 return stub_run(SUB_PRINT_PART)
             return stub_run(SUB_PRINT_NO_TRACK)
 
         videokit._run = fake_run
+        videokit.load_engine = lambda device="cpu": self.loads.append(device) or self.engine
         self.addCleanup(setattr, videokit, "_run", self.original)
+        self.addCleanup(setattr, videokit, "load_engine", self.original_engine)
         self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
         self.addCleanup(self._cleanup)
         self.out = self.tmp / "transcripts"
+        self.audio = self.tmp / "audio"
         self.buffer = io.StringIO()
+
+    def _argv(self, *extra: str) -> list[str]:
+        return [
+            "transcript", "BV1Y5QgB5Eas",
+            "--out", str(self.out),
+            "--audio-out", str(self.audio),
+            *extra,
+        ]
 
     def _cleanup(self):
         for child in sorted(self.tmp.rglob("*"), reverse=True):
@@ -1547,18 +1778,31 @@ class TranscriptCommand(unittest.TestCase):
 
     def test_a_bv_number_is_enough_to_produce_the_transcripts(self):
         with contextlib.redirect_stdout(self.buffer):
-            code = videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+            code = videokit.main(self._argv())
         self.assertEqual(code, 0)
-        self.assertEqual(len(list(self.out.iterdir())), 21)
+        self.assertEqual(len(list(self.out.iterdir())), 30)
 
-    def test_the_command_reports_the_parts_left_for_asr(self):
-        # The reader has to see which parts are missing and why, or the
-        # silence reads as success.
+    def test_the_missing_parts_are_filled_without_a_second_command(self):
+        # This is the acceptance criterion. 21 parts come from the platform
+        # tracks and the 9 without one are transcribed in the same run.
         with contextlib.redirect_stdout(self.buffer):
-            videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+            videokit.main(self._argv())
+        written = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual(len(written), 30)
+        for index in PARTS_WITHOUT_SUBTITLES:
+            with self.subTest(index=index):
+                self.assertTrue([n for n in written if n.startswith(f"{index:02d}-")])
+        self.assertEqual(self.loads, ["cpu"])
+
+    def test_the_command_reports_the_split_between_the_two_sources(self):
+        # The reader has to see where each part came from, or a transcript
+        # filled by ASR looks identical to one taken from a platform track.
+        with contextlib.redirect_stdout(self.buffer):
+            videokit.main(self._argv())
         printed = self.buffer.getvalue()
         self.assertIn("21", printed)
         self.assertIn("9", printed)
+        self.assertIn("platform", printed)
         self.assertIn("ASR", printed)
 
     def test_a_url_works_as_well_as_a_bare_bv_number(self):
@@ -1567,8 +1811,8 @@ class TranscriptCommand(unittest.TestCase):
                 [
                     "transcript",
                     "https://www.bilibili.com/video/BV1Y5QgB5Eas",
-                    "--out",
-                    str(self.out),
+                    "--out", str(self.out),
+                    "--audio-out", str(self.audio),
                 ]
             )
         self.assertEqual(code, 0)
@@ -1578,23 +1822,30 @@ class TranscriptCommand(unittest.TestCase):
         # A BV number is what a user has in hand, and the extractor needs the
         # URL. Nobody should have to paste the prefix.
         with contextlib.redirect_stdout(self.buffer):
-            videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
+            videokit.main(self._argv())
         self.assertEqual(self.calls[0][-1], "https://www.bilibili.com/video/BV1Y5QgB5Eas")
 
     def test_a_part_selection_can_be_named(self):
         with contextlib.redirect_stdout(self.buffer):
-            code = videokit.main(
-                ["transcript", "BV1Y5QgB5Eas", "--out", str(self.out), "--parts", "3,4"]
-            )
+            code = videokit.main(self._argv("--parts", "3,4"))
         self.assertEqual(code, 0)
         self.assertEqual(len(list(self.out.iterdir())), 2)
+
+    def test_a_selection_of_missing_parts_is_still_completed(self):
+        with contextlib.redirect_stdout(self.buffer):
+            code = videokit.main(self._argv("--parts", "1,3"))
+        self.assertEqual(code, 0)
+        names = sorted(p.name for p in self.out.iterdir())
+        self.assertEqual(len(names), 2)
+        self.assertTrue(names[0].startswith("01-"))
+        self.assertTrue(names[1].startswith("03-"))
 
     def test_the_output_directory_can_be_omitted(self):
         with contextlib.chdir(self.tmp):
             with contextlib.redirect_stdout(self.buffer):
                 code = videokit.main(["transcript", "BV1Y5QgB5Eas"])
         self.assertEqual(code, 0)
-        self.assertEqual(len(list((self.tmp / "transcripts").iterdir())), 21)
+        self.assertEqual(len(list((self.tmp / "transcripts").iterdir())), 30)
 
     def test_a_missing_video_reference_is_refused_with_usage(self):
         buffer = io.StringIO()
@@ -1613,6 +1864,91 @@ class TranscriptCommand(unittest.TestCase):
             code = videokit.main(["transcript", "BV1Y5QgB5Eas", "--out", str(self.out)])
         self.assertNotEqual(code, 0)
         self.assertIn("boom", buffer.getvalue())
+
+    def test_a_credential_problem_is_reported_rather_than_transcribed(self):
+        # A stale login makes every part read as trackless. Transcribing in
+        # that state would cost about 39 minutes and produce a full set of
+        # transcripts from the wrong cause, so the run refuses instead.
+        def logged_out(args, cookies):
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            return stub_run(LOGGED_OUT_SUBS, LOGIN_WARNING)
+
+        videokit._run = logged_out
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = videokit.main(self._argv())
+        self.assertNotEqual(code, 0)
+        self.assertIn("login", buffer.getvalue().lower())
+        self.assertEqual(self.engine.calls, [])
+
+
+class AsrPipeline(unittest.TestCase):
+    """The two paths converging on one structure, with neither the network,
+    the engine, nor a GPU in the room."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_a_filled_part_matches_the_shape_of_a_platform_part(self):
+        # Built by the two real paths rather than by hand, so a field added to
+        # one and not the other fails here.
+        video = videokit.Video(
+            id="BV1Y5QgB5Eas",
+            title="t",
+            parts=(
+                videokit.Part(1, "BV1Y5QgB5Eas_p1", "01-a", 100.0, ()),
+                videokit.Part(3, "BV1Y5QgB5Eas_p3", "03-b", 200.0, ("ai-zh",)),
+            ),
+        )
+        original = videokit._run
+
+        def fake_run(args, cookies):
+            if "--audio-format" in args:
+                return stub_run(str(self.tmp / "01.wav"))
+            return stub_run(SUB_PRINT_PART)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", original)
+
+        asr = videokit.part_transcript(
+            video, video.parts[0], engine=self.engine, audio_dir=self.tmp
+        )
+        platform = videokit.part_transcript(video, video.parts[1])
+        self.assertEqual(asr.source, "asr")
+        self.assertEqual(platform.source, "platform")
+        for record in (asr, platform):
+            with self.subTest(source=record.source):
+                self.assertEqual(record.status, "ok")
+                self.assertIsNone(record.failure_reason)
+                self.assertTrue(record.segments)
+                self.assertEqual(tuple(sorted(record.__dataclass_fields__)), MODEL_FIELDS)
+
+    def test_the_delivered_file_does_not_say_which_path_produced_it(self):
+        for source, segments in (
+            ("platform", videokit.parse_srt(SRT_P18)),
+            ("asr", videokit.asr_segments(ASR_TEXT, ASR_TIMESTAMPS)),
+        ):
+            with self.subTest(source=source):
+                record = videokit.PartTranscript(
+                    bvid="BV1Y5QgB5Eas", index=9, title="09-t", duration_sec=1.0,
+                    source=source, language="ai-zh",
+                    segments=tuple(segments), status="ok",
+                )
+                delivered = videokit.write_transcript(
+                    record, self.tmp / source
+                ).read_text(encoding="utf-8")
+                self.assertTrue(delivered.strip())
+                self.assertNotIn(source, delivered)
+                self.assertNotIn("-->", delivered)
+                self.assertIsNone(re.search(r"\d{2}:\d{2}:\d{2}", delivered))
 
 
 # Raw output of one real ASR run, saved verbatim from the engine. This is the
@@ -1949,6 +2285,39 @@ class AsrDependencies(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("填充词", readme)
+
+    def test_both_accepted_tradeoffs_are_written_down(self):
+        # The ticket names two, and each has a remedy worth recording: no
+        # punctuation on the platform side, and no Simplified to Traditional
+        # conversion. A tradeoff that lives only in a commit message gets
+        # reverted by the next person.
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("无标点", readme)
+        self.assertIn("简繁", readme)
+
+    def test_the_conversion_package_name_trap_is_written_down(self):
+        # `opencc` is the only correct name. Two similarly named packages
+        # convert character by character and mistranslate 头发 into 頭發, so
+        # naming the wrong one is a silent error rather than a crash.
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("opencc", readme)
+        self.assertIn("头发", readme)
+        self.assertIn("頭發", readme)
+
+    def test_the_punctuation_difference_is_written_down_in_the_source(self):
+        # The same two tradeoffs belong beside the code that embodies them,
+        # not only in the README. The module's comments are in English, so the
+        # markers asserted here are the English ones.
+        source = (
+            Path(__file__).resolve().parent.parent / "videokit.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("opencc", source)
+        self.assertIn("头发", source)
+        self.assertIn("punctuation", source)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,14 @@ class Segment:
     punctuation is zero, as is the count of ASCII `, ? ! ;`. The text is one
     continuous run. This is an accepted tradeoff, not a defect, and not
     something this module repairs.
+
+    The two transcript sources therefore disagree on punctuation, and a single
+    course mixes both styles: platform text reads as one unbroken run, ASR text
+    carries marks because `ct-punc` puts them there. Repairing the platform
+    side would mean running punctuation restoration over it, which recomputes
+    timestamps that are already correct. Accepted for this round, recorded in
+    the README. No Simplified to Traditional conversion is applied either; see
+    `_asr_record` for why the correct package name matters if that changes.
     """
 
     start_sec: float
@@ -934,7 +942,13 @@ def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
 
 
 def _pending_record(bvid: str, part: Part) -> PartTranscript:
-    """The record for a part whose subtitles are missing, so ASR owes it one."""
+    """The record for a part whose subtitles are missing, so ASR owes it one.
+
+    Nothing reaches this in a normal run any more: `part_transcript` fills such
+    a part from its audio instead of stopping here. It survives as the outcome
+    for a part whose audio could not be fetched, which is the case ticket #18
+    records as `failed` with `failure_reason = "no_audio"`.
+    """
     return PartTranscript(
         bvid=bvid,
         index=part.index,
@@ -944,6 +958,112 @@ def _pending_record(bvid: str, part: Part) -> PartTranscript:
         language=None,
         segments=(),
         status="pending",
+    )
+
+
+# What the ASR path reports as the language of a transcript it produced. The
+# engine is `paraformer-zh`, so the answer is Chinese regardless of what the
+# platform track was called. Measured on the 21 recorded tracks, the platform
+# side is always `ai-zh`, and the spec allows `"zh"` as the ASR value.
+ASR_LANGUAGE = "zh"
+
+# The name `download_audio` writes, so a part's audio can be found again
+# without a second network call. `%(playlist_index)02d` is what puts the part
+# number in the name, and the extension is `wav` after the transcoding step.
+AUDIO_TEMPLATE = "%(playlist_index)02d.%(ext)s"
+
+
+def audio_path(audio_dir: Path, index: int) -> Path:
+    """Where `download_audio` puts one part's WAV."""
+    return Path(audio_dir) / f"{index:02d}.wav"
+
+
+def part_audio(
+    video: Video,
+    part: Part,
+    audio_dir: Path,
+    cookies: Path | None = None,
+) -> Path | None:
+    """The 16 kHz mono WAV for one part, downloading it only when absent.
+
+    Already on disk, it is returned without a network call. The nine parts of
+    the first target that need ASR were downloaded once and total 1.1 GB, so
+    re-fetching them on a rerun would cost that download again for nothing.
+
+    None means yt-dlp reported no file, which is the input ticket #18 needs in
+    order to record `failure_reason = "no_audio"`. This function does not
+    decide that outcome; it only reports it.
+    """
+    existing = audio_path(audio_dir, part.index)
+    if existing.is_file():
+        return existing
+    written = download_audio(
+        video_url(video.id), audio_dir, parts=[part.index], cookies=cookies
+    )
+    if not written:
+        return None
+    return written[0]
+
+
+def _asr_record(
+    video: Video,
+    part: Part,
+    audio_dir: Path,
+    engine,
+    cookies: Path | None,
+    device: str,
+) -> PartTranscript:
+    """Complete one part from its audio, in the same shape the platform path uses.
+
+    The only field that differs between the two sources is `source`. Everything
+    else is filled the same way, which is what lets a deliverable be produced
+    without asking where it came from.
+
+    `LoginRequired` is not caught here and must not be. It travels up with its
+    next-step message, because transcribing a whole course in response to a
+    stale credential would cost about 39 minutes and produce a full set of
+    transcripts from the wrong cause.
+
+    Two accepted tradeoffs land in this record rather than in the delivered
+    file.
+
+    The ASR path carries punctuation and the platform path does not, so one
+    course mixes two styles. Measured over the 21 recorded tracks, 454245 text
+    characters, the CJK punctuation count is zero; `ct-punc` puts marks in the
+    ASR text. Repairing the platform side would mean running punctuation
+    restoration over it too, and that recomputes the timestamps that are already
+    correct. Not done in this round.
+
+    No Simplified to Traditional conversion is applied. Both sides come back in
+    Simplified and are delivered that way. If that ever changes, the correct
+    package is `opencc`; two similarly named packages mistranslate, turning
+    「头发」 into 「頭發」 because they convert character by character instead of
+    by phrase.
+    """
+    wav = part_audio(video, part, audio_dir, cookies)
+    if wav is None:
+        # Room for ticket #18. The audio could not be fetched, so there is
+        # nothing to transcribe and no transcript to deliver. #18 records this
+        # as `status = "failed"` with `failure_reason = "no_audio"`, which is
+        # the value that tells a caller not to bother retrying. Until then the
+        # part comes back `pending`, no file is written for it, and the batch
+        # carries on, because one part with no audio must not end the run.
+        return _pending_record(video.id, part)
+    if engine is None:
+        # One load per batch is the point of the `engine` argument. A caller
+        # walking 30 parts passes one in; this branch is for a caller that
+        # transcribes a single part.
+        engine = load_engine(device)
+    segments = transcribe(wav, engine=engine, device=device)
+    return PartTranscript(
+        bvid=video.id,
+        index=part.index,
+        title=part.title,
+        duration_sec=part.duration_sec,
+        source="asr",
+        language=ASR_LANGUAGE,
+        segments=tuple(segments),
+        status="ok",
     )
 
 
@@ -974,36 +1094,51 @@ def part_transcript(
     video: Video,
     part: Part,
     cookies: Path | None = None,
+    audio_dir: Path | None = None,
+    engine=None,
+    device: str = "cpu",
 ) -> PartTranscript:
-    """Judge one part and produce its transcript record.
+    """Judge one part and produce its transcript record, from either source.
 
     The judgment is per part, never per video. Measured on the first real
     target, 21 of 30 parts carry a track and 9 do not, and the state does not
     follow part length, so a whole-video answer would be wrong for one group
     or the other.
 
-    A part with no track returns a `pending` record rather than raising. An
-    exception here would abort the batch at part 1 of this course, and the
-    nine parts without a track are spread through the middle of it.
+    **The two sources meet here and nowhere downstream.** A part with a track
+    is assembled from it with `source = "platform"`; a part without one is
+    transcribed from its own audio with `source = "asr"`. Every other field is
+    filled identically, so a caller that has a `PartTranscript` cannot tell
+    which path produced it, and `write_transcript` does not ask. This is the
+    join the ticket is about, and it is why a missing part is completed
+    without a second command.
 
-    A credential fault is not the same thing and is not swallowed. Once the
-    login is stale every part reads as trackless, so treating that as
-    `pending` would hand the whole course to the ASR path in response to a
-    problem that re-exporting the credential fixes. Ticket #13 raises
-    `LoginRequired` for that, and it is deliberately not caught here, so it
-    travels up with its next-step message. `SubtitleUnavailable` is the only
-    outcome that means "this part needs ASR".
+    A credential fault is not either source and is not swallowed. Once the
+    login is stale every part reads as trackless, so sending all 30 to the ASR
+    path would cost about 39 minutes in response to a problem that
+    re-exporting the credential fixes. Ticket #13 raises `LoginRequired` for
+    that, and it is deliberately not caught here, so it travels up with its
+    next-step message. `SubtitleUnavailable` is the only outcome that means
+    "this part needs ASR".
+
+    `engine` is passed in for the same reason `transcribe` takes one: a load
+    costs 29 to 50 seconds, so a batch loads once. `audio_dir` is where the
+    part's WAV lives, or is put.
     """
     if not part.has_subtitles:
-        return _pending_record(video.id, part)
+        return _asr_record(
+            video, part, audio_dir or default_audio_dir(), engine, cookies, device
+        )
     language = _preferred_language(part)
     try:
         segments = part_subtitles(video_url(video.id), part.index, language, cookies)
     except SubtitleUnavailable:
         # The probe table and the fetch can disagree, for instance if the
         # track was withdrawn between the two calls. Either way this part
-        # still needs a transcript from somewhere, so it is pending.
-        return _pending_record(video.id, part)
+        # still needs a transcript from somewhere, and ASR is that somewhere.
+        return _asr_record(
+            video, part, audio_dir or default_audio_dir(), engine, cookies, device
+        )
     return PartTranscript(
         bvid=video.id,
         index=part.index,
@@ -1016,31 +1151,105 @@ def part_transcript(
     )
 
 
+def default_audio_dir() -> Path:
+    """Where a part's audio goes when the caller names no directory.
+
+    Kept apart from the delivered transcripts, because a WAV is a working
+    file: 100 MB per part against a few hundred KB of text.
+    """
+    return Path.cwd() / "audio"
+
+
+class _DeferredEngine:
+    """Loads the engine on first use, and only if something needs it.
+
+    Built for `transcripts` so that a batch which never hits a part without a
+    track does not pay 29 to 50 seconds for a model it will not use, while a
+    batch that does hit one still loads it exactly once. `transcribe` receives
+    this object as if it were the engine, and the first call to `generate`
+    triggers the load.
+
+    Device verification is the caller's, not this class's, so a silently
+    downgraded GPU request still fails before any audio is read.
+    """
+
+    def __init__(self, device: str = "cpu", loader=None):
+        self._device = device
+        self._loader = loader or load_engine
+        self._engine = None
+        self.loads = 0
+
+    def _resolve(self):
+        if self._engine is None:
+            self._engine = self._loader(self._device)
+            self.loads += 1
+        return self._engine
+
+    def generate(self, **kwargs):
+        return self._resolve().generate(**kwargs)
+
+    # `verify_device` reads this, so it is forwarded to the real engine rather
+    # than answered here. Reading it before the engine is loaded is what would
+    # defeat the point, so the load happens first.
+    @property
+    def model(self):
+        return self._resolve().model
+
+
 def transcripts(
     url: str,
     out_dir: Path,
     parts: list[int] | None = None,
     cookies: Path | None = None,
+    audio_dir: Path | None = None,
+    engine=None,
+    device: str = "cpu",
 ) -> tuple[PartTranscript, ...]:
-    """Judge every part of `url` and deliver a transcript for each one that has one.
+    """Judge every part of `url` and deliver one transcript per part.
 
-    Returns one record per part, in course order, whether or not a file was
-    written. Callers get the `pending` parts too, because "which parts still
-    need ASR" is the question the next ticket asks.
+    Both sources are covered in one pass. A part with a track is delivered
+    from that track; a part without one is transcribed from its own audio and
+    delivered the same way, with no second command and no separate flag.
+
+    `url` accepts a bare BV number as well as a link, the same as the CLI. The
+    documented call is `transcripts("BV1Y5QgB5Eas", ...)`, and handing a bare
+    identifier straight to yt-dlp fails with `'BV1Y5QgB5Eas' is not a valid
+    URL`, measured against the real program.
+
+    Returns one record per part, in course order, after writing a file for
+    each. A record that is not `ok` is ticket #18's business.
 
     Processing does not stop at a part without subtitles. It does stop on a
     credential fault, which is not a per-part condition: it makes every part
     look trackless, so continuing would run the ASR path over the whole course
     and produce a full set of transcripts from the wrong cause.
+
+    **The engine is loaded once for the whole batch, not once per part.** The
+    measured cost is 29 to 50 seconds per load against about 200 seconds per
+    47 minute part, so a per-part load would add roughly 20 minutes to this
+    batch. `_DeferredEngine` defers the load until a part actually needs it,
+    and a caller that already holds an engine passes it in as `engine`.
     """
-    video = probe(url, cookies)
+    video = probe(video_url(url), cookies)
     selected = [
         part for part in video.parts if parts is None or part.index in parts
     ]
+    holder = engine if engine is not None else _DeferredEngine(device)
     records: list[PartTranscript] = []
     for part in selected:
-        record = part_transcript(video, part, cookies)
+        record = part_transcript(
+            video,
+            part,
+            cookies=cookies,
+            audio_dir=audio_dir or default_audio_dir(),
+            engine=holder,
+            device=device,
+        )
         if record.status == "ok":
+            # Guard kept for ticket #18 and #19. A record that is not `ok` has
+            # no transcript to write, and an empty file for one would read as
+            # finished. Once #18 produces `failed` records, this same check is
+            # what keeps them from leaving a misleading file behind.
             write_transcript(record, out_dir)
         records.append(record)
     return tuple(records)
@@ -1135,7 +1344,7 @@ def download_audio(
         selector="30280",
         out_dir=out_dir,
         cookies=cookies,
-        template="%(playlist_index)02d.%(ext)s",
+        template=AUDIO_TEMPLATE,
         extra=[
             "-x",
             "--audio-format", "wav",
@@ -1145,22 +1354,33 @@ def download_audio(
 
 
 def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
-    """The line printed after a batch, naming what was produced and what was not.
+    """The line printed after a batch, naming what was produced and from where.
 
-    The `pending` count is the point of the line. Without it a short run looks
-    exactly like a complete one.
+    The source split is the point of the line. A part filled by ASR and a part
+    taken from a platform track produce files that read differently, so a
+    reader who saw only "30 of 30" would not know how much of the course was
+    machine-transcribed. The `pending` count stays for the case ticket #18
+    will produce, a part that could not be transcribed at all.
     """
     records = list(records)
     delivered = [r for r in records if r.status == "ok"]
+    platform = [r for r in delivered if r.source == "platform"]
+    asr = [r for r in delivered if r.source == "asr"]
     pending = [r for r in records if r.status == "pending"]
     failed = [r for r in records if r.status == "failed"]
     lines = [
         f"delivered {len(delivered)} of {len(records)} parts to {out_dir}",
     ]
+    if delivered:
+        lines.append(
+            f"{len(platform)} from platform subtitles, "
+            f"{len(asr)} from ASR"
+            + (f" (parts {', '.join(str(r.index) for r in asr)})" if asr else "")
+        )
     if pending:
         lines.append(
-            f"{len(pending)} parts await ASR "
-            f"(no subtitle track): {', '.join(str(r.index) for r in pending)}"
+            f"{len(pending)} parts have no transcript "
+            f"(parts {', '.join(str(r.index) for r in pending)})"
         )
     if failed:
         lines.append(
@@ -1473,19 +1693,28 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _transcript_command(rest: list[str]) -> int:
-    """`videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]`."""
+    """`videokit transcript <BV号或链接> [--out 目录] [--parts 3,4] [--audio-out 目录]`.
+
+    One command for both sources. A part without a subtitle track is
+    transcribed from its own audio as part of this run, so the caller does not
+    have to notice which parts were missing and invoke something else.
+    """
     reference = next((a for a in rest if not a.startswith("-")), None)
     if reference is None:
         print(
-            "usage: videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]",
+            "usage: videokit transcript <BV号或链接> [--out 目录] "
+            "[--parts 3,4] [--audio-out 目录]",
             file=sys.stderr,
         )
         return 2
     out_dir = Path(_option(rest, "--out") or Path.cwd() / "transcripts")
+    audio_dir = Path(_option(rest, "--audio-out") or default_audio_dir())
     selection = _option(rest, "--parts")
     parts = [int(p) for p in selection.split(",")] if selection else None
     try:
-        records = transcripts(video_url(reference), out_dir, parts)
+        records = transcripts(
+            video_url(reference), out_dir, parts, audio_dir=audio_dir
+        )
     except VideoKitError as exc:
         print(f"transcript failed: {exc}", file=sys.stderr)
         return 1
