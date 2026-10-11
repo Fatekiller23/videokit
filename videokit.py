@@ -834,18 +834,22 @@ class PartTranscript:
     taken from a platform track and a part filled in by ASR carry different
     timestamp granularity and different punctuation.
 
-    `status` has a third value beyond the spec's `ok` / `failed`. A part with
-    no subtitle track is neither: its transcript does not exist yet, and the
-    ASR path is expected to produce it. Recording that as `ok` would claim a
-    transcript that is not there, and recording it as `failed` with
-    `failure_reason = "no_audio"` would blame the audio, which is present.
-    `pending` is what is left, and the nine such parts of a 30-part course are
-    the reason the value exists.
+    `status` is `"ok"`, `"skipped"` or `"failed"`, and a failed record always
+    carries a `failure_reason`. Ticket #17 had a third value, `pending`, for a
+    part whose track was missing and whose audio had not been fetched yet. It is
+    gone now that both outcomes are decided in one pass: a part either produced
+    a transcript or it failed, and a value nothing can produce is vocabulary that
+    only invites a caller to handle a case that cannot happen.
+
+    `skipped` is ticket #19's value, for a part whose delivered file was already
+    on disk and complete. It is separate from `ok` because the summary and the
+    caller both need to tell "this run made it" from "it was already there", and
+    counting both as delivered would report a second pass that produced two
+    parts as a pass that produced thirty.
 
     `status` and `failure_reason` stay separate because the reason decides
     whether a rerun can help. `no_audio` cannot be fixed by retrying;
     `asr_error` can. Merged into one field, a caller cannot tell them apart.
-    This ticket produces no `failed` record. Ticket #18 owns that path.
     """
 
     bvid: str
@@ -916,8 +920,13 @@ def transcript_text(segments: Iterable[Segment]) -> str:
     return "".join(pieces)
 
 
-def transcript_filename(record: PartTranscript) -> str:
-    """The delivered file's name, ordered by part.
+def delivered_name(index: int, title: str) -> str:
+    """The name a delivered artifact carries, from the two fields that set it.
+
+    Takes the index and title rather than a record because the skip pre-check
+    has to name an artifact before any transcript record exists for it. One
+    function builds the name for both paths, so the file the pre-check probes
+    and the file `write_transcript` produces cannot disagree.
 
     The index prefix is what makes a directory listing read in course order,
     because every title begins with the course name rather than with its own
@@ -929,8 +938,18 @@ def transcript_filename(record: PartTranscript) -> str:
     not a repair.
     """
     unsafe = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-    title = unsafe.sub("_", record.title).strip().rstrip(".")
-    return f"{record.index:02d}-{title}.txt"
+    safe = unsafe.sub("_", title).strip().rstrip(".")
+    return f"{index:02d}-{safe}.txt"
+
+
+def transcript_filename(record: PartTranscript) -> str:
+    """The delivered file's name for one record."""
+    return delivered_name(record.index, record.title)
+
+
+def transcript_path(out_dir: Path, index: int, title: str) -> Path:
+    """Where this part's delivered artifact belongs, without writing it."""
+    return Path(out_dir) / delivered_name(index, title)
 
 
 def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
@@ -939,24 +958,71 @@ def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
     Plain text, UTF-8, no timestamps, no source marker, no quality grade. The
     name carries the part index and title.
 
-    A `pending` record has no transcript to write. Writing an empty file for
-    one would look finished, which is the outcome `SubtitleUnavailable` exists
-    to prevent, so callers must not ask.
+    A failed record has no transcript to write. Writing an empty file for one
+    would look finished, which is the outcome `SubtitleUnavailable` exists to
+    prevent, so callers must not ask.
+
+    **The payload is built in full, written to a neighbouring temporary file,
+    then swapped into place.** `Path.write_text` opens the target with mode `w`,
+    which truncates it before writing anything, so an interruption in between
+    leaves a short file under the delivered name. Measured on this machine, a
+    finished 1500 byte artifact became zero bytes when the rewrite failed at
+    the encode step, and the same thing happens to a process killed mid-write.
+    After this change an interruption leaves either the old artifact untouched
+    or no file at all, never a plausible fragment. That matters more since the
+    skip check reads the artifact to decide whether to trust it: a truncated
+    file is exactly the shape the check has to judge, and this keeps the module
+    from being the thing that creates one.
+
+    The temporary file is a sibling, not a file in the system temp directory.
+    `os.replace` is only atomic within one filesystem, and a temp directory is
+    often on another, where the call degrades to a copy and the atomicity goes
+    away.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / transcript_filename(record)
-    path.write_text(transcript_text(record.segments), encoding="utf-8")
+    path = transcript_path(out_dir, record.index, record.title)
+    payload = transcript_text(record.segments)
+    # Encoded before the temporary file exists, so a payload that cannot be
+    # encoded fails with the previous artifact still in place.
+    data = payload.encode("utf-8")
+    staging = path.with_name(f".{path.name}.partial")
+    try:
+        staging.write_bytes(data)
+        os.replace(staging, path)
+    finally:
+        # A crash cannot reach this, but a failed `os.replace` can, and a
+        # leftover working file would sit in the output directory looking like
+        # an artifact to anything that globs it.
+        staging.unlink(missing_ok=True)
     return path
 
 
-def _pending_record(bvid: str, part: Part) -> PartTranscript:
-    """The record for a part whose subtitles are missing, so ASR owes it one.
+# The lowest density a finished transcript can have and still be called
+# finished. Measured over the 30 delivered artifacts of the first real course,
+# the range is 4.239 characters per second of probed part duration on part 30
+# to 5.418 on part 23, a spread of 1.28 times across parts of one course, so
+# the floor is deliberately not set at the observed low end. A floor above a
+# real part's density would re-transcribe a finished part, which costs minutes;
+# the floor below accepts a file that is only grossly short, which is what the
+# atomic write in `write_transcript` exists to make impossible in the first
+# place. 3.0 carries no false rejection on any of the 30 measured artifacts and
+# rejects the measured half file at 2.701.
+_MIN_CHARS_PER_SEC = 3.0
 
-    Nothing reaches this in a normal run any more: `part_transcript` fills such
-    a part from its audio instead of stopping here. It survives as the outcome
-    for a part whose audio could not be fetched, which is the case ticket #18
-    records as `failed` with `failure_reason = "no_audio"`.
+
+def _skipped_record(part: Part, bvid: str) -> PartTranscript:
+    """The record for a part whose artifact was already on disk.
+
+    Carries no segments. It could read them back, but nothing consumes them
+    here: the delivered file is the artifact, the run does not rewrite it, and
+    reading a 50 KB file per skipped part to fill a field nobody asks for is
+    work without a reader. `status` is what the summary and the caller go on.
+
+    `skipped` joins the spec's `ok` / `failed`. A skipped part is `ok` in the
+    sense that its transcript exists, and it is deliberately not recorded as
+    `ok` because that would count it among the parts this run produced. The
+    ticket asks for exactly that separation.
     """
     return PartTranscript(
         bvid=bvid,
@@ -966,7 +1032,74 @@ def _pending_record(bvid: str, part: Part) -> PartTranscript:
         source=None,
         language=None,
         segments=(),
-        status="pending",
+        status="skipped",
+    )
+
+
+def transcript_complete(path: Path, duration_sec: float) -> bool:
+    """Whether the artifact at `path` is a finished transcript for this part.
+
+    Existence alone cannot answer this. The delivered file is continuous UTF-8
+    text with no trailing newline and no end marker, so a file left by an
+    interrupted write is a clean prefix of the real thing and looks like a
+    transcript from the outside. Treating one as finished loses the content
+    that never got written and never says so, which is the failure this
+    function exists to prevent.
+
+    The file must decode as strict UTF-8. Every artifact is UTF-8 Chinese, so
+    most of its bytes are the leading or continuation byte of a three byte
+    character. Cutting the stream at an arbitrary offset therefore usually
+    splits one, and measured over 30 real artifacts at 11 cut points, 223 of
+    330 arbitrary byte cuts raise UnicodeDecodeError.
+
+    The remaining 107 cuts land on a character boundary and decode cleanly, so
+    decoding is not enough on its own. Measured on part 23 cut at byte 25591,
+    the half file is 8537 clean characters and reads as a transcript. The
+    second check is therefore length against the probed duration: a finished
+    artifact carries at least `_MIN_CHARS_PER_SEC` characters per second of its
+    part, and an interrupted one carries a fraction of that.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not text.strip():
+        return False
+    return len(text) >= _MIN_CHARS_PER_SEC * duration_sec
+
+
+def _failed_record(bvid: str, part: Part, reason: str) -> PartTranscript:
+    """The record for a part that produced no transcript.
+
+    `status = "failed"` and `failure_reason` are separate fields because the
+    reason decides whether a rerun is worth anything. **`no_audio` cannot be
+    fixed by retrying; `asr_error` can.** A part whose audio does not exist on
+    the platform will still not have it on the tenth attempt, so a caller that
+    retries one spends an hour of recognition to fail again. A part whose
+    engine raised may well succeed on the next run, so a caller that gives up
+    on one loses a transcript it could have had. Merged into a single field, no
+    caller can tell which of the two it is holding, and the two call for
+    opposite actions.
+
+    Nothing is written for a failed part. An empty file reads as a finished
+    transcript, so `transcripts` guards the write on `status == "ok"`.
+
+    A failed record carries no `source`: no path produced the text, and naming
+    one would claim a provenance that does not exist.
+    """
+    return PartTranscript(
+        bvid=bvid,
+        index=part.index,
+        title=part.title,
+        duration_sec=part.duration_sec,
+        source=None,
+        language=None,
+        segments=(),
+        status="failed",
+        failure_reason=reason,
     )
 
 
@@ -999,9 +1132,9 @@ def part_audio(
     the first target that need ASR were downloaded once and total 1.1 GB, so
     re-fetching them on a rerun would cost that download again for nothing.
 
-    None means yt-dlp reported no file, which is the input ticket #18 needs in
-    order to record `failure_reason = "no_audio"`. This function does not
-    decide that outcome; it only reports it.
+    None means yt-dlp reported no file, which is what `_asr_record` turns into
+    `failure_reason = "no_audio"`. This function does not decide that outcome;
+    it only reports it.
     """
     existing = audio_path(audio_dir, part.index)
     if existing.is_file():
@@ -1051,13 +1184,13 @@ def _asr_record(
     """
     wav = part_audio(video, part, audio_dir, cookies)
     if wav is None:
-        # Room for ticket #18. The audio could not be fetched, so there is
-        # nothing to transcribe and no transcript to deliver. #18 records this
-        # as `status = "failed"` with `failure_reason = "no_audio"`, which is
-        # the value that tells a caller not to bother retrying. Until then the
-        # part comes back `pending`, no file is written for it, and the batch
+        # The platform reported no audio file for this part, so there is
+        # nothing to transcribe and no transcript to deliver. The part is
+        # recorded `failed` with `failure_reason = "no_audio"`, the value that
+        # tells a caller not to retry: the audio does not exist to be fetched,
+        # so a second attempt fails the same way at the same point. The batch
         # carries on, because one part with no audio must not end the run.
-        return _pending_record(video.id, part)
+        return _failed_record(video.id, part, "no_audio")
     if engine is None:
         # One load per batch is the point of the `engine` argument. A caller
         # walking 30 parts passes one in; this branch is for a caller that
@@ -1226,12 +1359,22 @@ def transcripts(
     URL`, measured against the real program.
 
     Returns one record per part, in course order, after writing a file for
-    each. A record that is not `ok` is ticket #18's business.
+    each. A failed part produces a record with no file and a `failure_reason`
+    naming why, which `transcript_report` prints once the batch is done.
 
-    Processing does not stop at a part without subtitles. It does stop on a
-    credential fault, which is not a per-part condition: it makes every part
-    look trackless, so continuing would run the ASR path over the whole course
-    and produce a full set of transcripts from the wrong cause.
+    Processing does not stop at a part without subtitles, and it does not stop
+    at a part that fails. One part with no audio, or one part whose ASR raised,
+    is that part's problem; the remaining parts are still worth their
+    transcript, and a 30-part batch that abandoned everything on one fault
+    would waste the other 29 parts of compute. A part already delivered is not
+    touched by a later failure: each part is written as it completes and
+    nothing rewinds.
+
+    Two faults are deliberately not treated as failed parts, because they are
+    not conditions of a part. A credential fault makes every part look
+    trackless, and a missing ASR install makes every part fail at the engine.
+    Both travel up with the message naming the one action that fixes them,
+    rather than being recorded thirty times as thirty failing parts.
 
     **The engine is loaded once for the whole batch, not once per part.** The
     measured cost is 29 to 50 seconds per load against about 200 seconds per
@@ -1246,19 +1389,62 @@ def transcripts(
     holder = engine if engine is not None else _DeferredEngine(device)
     records: list[PartTranscript] = []
     for part in selected:
-        record = part_transcript(
-            video,
-            part,
-            cookies=cookies,
-            audio_dir=audio_dir or default_audio_dir(),
-            engine=holder,
-            device=device,
-        )
+        # The pre-check. A finished artifact means no work at all for this
+        # part: no subtitle fetch, no audio download, no model call. This is
+        # what makes a second run over a nearly complete course fast, and it
+        # is the only persistence the spec allows.
+        #
+        # It reads the artifact rather than trusting that the name exists,
+        # because an interrupted write leaves a clean prefix of a real
+        # transcript under the real name. See `transcript_complete`.
+        #
+        # It sits ahead of the `try` below on purpose. A part that is already
+        # delivered cannot fail, and skipping it keeps the failure path from
+        # having to reason about a part it did no work for.
+        existing = transcript_path(out_dir, part.index, part.title)
+        if transcript_complete(existing, part.duration_sec):
+            records.append(_skipped_record(part, video.id))
+            continue
+        try:
+            record = part_transcript(
+                video,
+                part,
+                cookies=cookies,
+                audio_dir=audio_dir or default_audio_dir(),
+                engine=holder,
+                device=device,
+            )
+        except (LoginRequired, TranscriptionUnavailable):
+            # Neither is a condition of this part, so neither is a failed part.
+            # A stale credential makes every part look trackless, and a missing
+            # ASR install makes every part fail at the engine. Recording either
+            # one thirty times would report a single machine-level fault as
+            # thirty per-part faults and drop the one action that fixes it,
+            # which is the install or the re-login its own message names.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Every other exception is this part's own, and the class is not
+            # the information the caller acts on. The engine stack raises what
+            # it raises: a torch allocation fault, a decoder refusing a
+            # damaged WAV, or this module's own refusal to pair a mismatched
+            # ASR result. All of them mean the same thing operationally, which
+            # is that this part produced no transcript and a rerun may well
+            # succeed, so all of them are `asr_error`. A 30-part batch must not
+            # end because one part did, and an interrupt still must, so
+            # KeyboardInterrupt is left alone by catching `Exception`.
+            record = _failed_record(video.id, part, "asr_error")
+            print(
+                f"part {part.index} failed (asr_error): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         if record.status == "ok":
-            # Guard kept for ticket #18 and #19. A record that is not `ok` has
-            # no transcript to write, and an empty file for one would read as
-            # finished. Once #18 produces `failed` records, this same check is
-            # what keeps them from leaving a misleading file behind.
+            # A record that is not `ok` has no transcript to write, and an
+            # empty file for one would read as finished. This is also what
+            # keeps a failure from touching a part already delivered: each part
+            # is written as it completes and nothing rewinds, so a failure on
+            # part 20 leaves parts 1 to 19 on disk exactly as they were.
             write_transcript(record, out_dir)
         records.append(record)
     return tuple(records)
@@ -1435,20 +1621,48 @@ def download_audio(
     )
 
 
+# What each failure reason means for a rerun. `no_audio` cannot be fixed by
+# retrying: the platform has no audio for that part, so the tenth attempt fails
+# at the same place as the first. `asr_error` can: the engine loaded and
+# worked on other parts, so a transient fault, a damaged file fetched once, or
+# a model that ran out of memory may well succeed next time.
+#
+# The reason string alone does not say this, and the person reading the summary
+# has just waited 40 minutes. Naming the consequence beside the reason is the
+# whole point of keeping `status` and `failure_reason` apart, so the summary
+# states it rather than making the reader look it up.
+_RETRYABLE = {"asr_error": True, "no_audio": False}
+
+
 def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
     """The line printed after a batch, naming what was produced and from where.
 
-    The source split is the point of the line. A part filled by ASR and a part
-    taken from a platform track produce files that read differently, so a
-    reader who saw only "30 of 30" would not know how much of the course was
-    machine-transcribed. The `pending` count stays for the case ticket #18
-    will produce, a part that could not be transcribed at all.
+    The source split is the point of the first two lines. A part filled by ASR
+    and a part taken from a platform track produce files that read differently,
+    so a reader who saw only "30 of 30" would not know how much of the course
+    was machine-transcribed.
+
+    The failed line names each part and its reason, and says which of the two
+    reasons a rerun would fix. That is the distinction `failure_reason` exists
+    for. A caller who cannot tell `no_audio` from `asr_error` either reruns a
+    part that can never succeed or abandons one that would succeed on the next
+    attempt.
+
+    A part that failed is not counted as delivered. Its number is in the
+    denominator because it was asked for, and absent from the numerator because
+    no file was written for it.
+
+    Skipped parts are counted on their own line and named for the same reason.
+    They were asked for, so they stay in the denominator, and they were not
+    produced by this run, so they stay out of the numerator. A second pass over
+    a course that is already 28 parts done would otherwise read as "2 of 30",
+    which is the opposite of what happened.
     """
     records = list(records)
     delivered = [r for r in records if r.status == "ok"]
     platform = [r for r in delivered if r.source == "platform"]
     asr = [r for r in delivered if r.source == "asr"]
-    pending = [r for r in records if r.status == "pending"]
+    skipped = [r for r in records if r.status == "skipped"]
     failed = [r for r in records if r.status == "failed"]
     lines = [
         f"delivered {len(delivered)} of {len(records)} parts to {out_dir}",
@@ -1459,17 +1673,30 @@ def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
             f"{len(asr)} from ASR"
             + (f" (parts {', '.join(str(r.index) for r in asr)})" if asr else "")
         )
-    if pending:
+    if skipped:
         lines.append(
-            f"{len(pending)} parts have no transcript "
-            f"(parts {', '.join(str(r.index) for r in pending)})"
+            f"skipped {len(skipped)} parts already delivered "
+            f"(parts {', '.join(str(r.index) for r in skipped)})"
         )
     if failed:
         lines.append(
             "failed: "
-            + ", ".join(f"{r.index} ({r.failure_reason})" for r in failed)
+            + ", ".join(
+                f"{r.index} ({r.failure_reason}, {_retry_word(r.failure_reason)})"
+                for r in failed
+            )
         )
     return "\n".join(lines)
+
+
+def _retry_word(reason: str | None) -> str:
+    """How a rerun would treat one failure reason.
+
+    An unknown reason is reported as retryable rather than silently as not.
+    Guessing "not retryable" would tell a caller to abandon a part that might
+    be recoverable, and this vocabulary is only ever written by this module.
+    """
+    return "retryable" if _RETRYABLE.get(reason, True) else "not retryable"
 
 
 class AsrError(VideoKitError):
