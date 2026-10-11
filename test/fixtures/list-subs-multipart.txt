@@ -1,0 +1,349 @@
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Downloading playlist BV1Y5QgB5Eas - add --no-playlist to download just the video BV1Y5QgB5Eas
+[download] Downloading playlist: �����2025���ۿΡ��й���۾���
+[BiliBili] Playlist �����2025���ۿΡ��й���۾���: Downloading 30 items of 30
+[download] Downloading item 1 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=1
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495245892
+[info] Available subtitles for BV1Y5QgB5Eas_p1:
+Language Formats
+danmaku  xml
+[download] Downloading item 2 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=2
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495377140
+[info] Available subtitles for BV1Y5QgB5Eas_p2:
+Language Formats
+danmaku  xml
+[download] Downloading item 3 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=3
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495637061
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p3:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 4 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=4
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495835171
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p4:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 5 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=5
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37495966624
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p5:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 6 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=6
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37496225956
+[info] Available subtitles for BV1Y5QgB5Eas_p6:
+Language Formats
+danmaku  xml
+[download] Downloading item 7 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=7
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37496294220
+[info] Available subtitles for BV1Y5QgB5Eas_p7:
+Language Formats
+danmaku  xml
+[download] Downloading item 8 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=8
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37496491469
+[info] Available subtitles for BV1Y5QgB5Eas_p8:
+Language Formats
+danmaku  xml
+[download] Downloading item 9 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=9
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37496687511
+[info] Available subtitles for BV1Y5QgB5Eas_p9:
+Language Formats
+danmaku  xml
+[download] Downloading item 10 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=10
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37496948294
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p10:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 11 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=11
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37497079955
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p11:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 12 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=12
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37497275854
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p12:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 13 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=13
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37497408890
+[info] Available subtitles for BV1Y5QgB5Eas_p13:
+Language Formats
+danmaku  xml
+[download] Downloading item 14 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=14
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37497604949
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p14:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 15 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=15
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37497865642
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p15:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 16 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=16
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498063436
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p16:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 17 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=17
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498194268
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p17:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 18 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=18
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498455714
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p18:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 19 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=19
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498585385
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p19:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 20 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=20
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498719620
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p20:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 21 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=21
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37498912944
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p21:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 22 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=22
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37499111649
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p22:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 23 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=23
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37499242412
+[info] Available subtitles for BV1Y5QgB5Eas_p23:
+Language Formats
+danmaku  xml
+[download] Downloading item 24 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=24
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37499373728
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p24:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 25 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=25
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37499637164
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p25:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 26 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=26
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37499833528
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p26:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 27 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=27
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37500030735
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p27:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 28 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=28
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37500290457
+[info] Available subtitles for BV1Y5QgB5Eas_p28:
+Language Formats
+danmaku  xml
+[download] Downloading item 29 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=29
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37500420426
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p29:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Downloading item 30 of 30
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1Y5QgB5Eas?p=30
+[BiliBili] 1Y5QgB5Eas: Downloading webpage
+[BiliBili] BV1Y5QgB5Eas: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 116402874751797: Extracting chapters
+[BiliBili] BV1Y5QgB5Eas: Extracting subtitle info 37500552338
+[BiliBili] BV1Y5QgB5Eas: Downloading JSON metadata
+[info] Available subtitles for BV1Y5QgB5Eas_p30:
+Language Formats
+danmaku  xml
+ai-zh    srt
+[download] Finished downloading playlist: �����2025���ۿΡ��й���۾���

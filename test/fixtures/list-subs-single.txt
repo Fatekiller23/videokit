@@ -1,0 +1,33 @@
+[BiliBili] Extracting URL: https://www.bilibili.com/video/BV1GJ411x7h7
+[BiliBili] 1GJ411x7h7: Downloading webpage
+[BiliBili] BV1GJ411x7h7: Extracting videos in anthology
+[BiliBili] Format(s) 1080P ������ are missing; you have to become a premium member to download them. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies
+[BiliBili] 80433022: Extracting chapters
+[BiliBili] BV1GJ411x7h7: Extracting subtitle info 137649199
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[BiliBili] BV1GJ411x7h7: Downloading JSON metadata
+[info] Available subtitles for BV1GJ411x7h7:
+Language Formats
+danmaku  xml
+zh-CN    srt
+zh-Hans  srt
+zh-Hant  srt
+zh-HK    srt
+en-US    srt
+ja       srt
+ko       srt
+de-DE    srt
+ru       srt
+iw       srt
+ca       srt
+ase      srt
