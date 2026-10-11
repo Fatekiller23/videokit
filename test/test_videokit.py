@@ -9,6 +9,8 @@ Run: python test/test_videokit.py
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -629,6 +631,68 @@ class GuidedLogin(unittest.TestCase):
         with self.assertRaises(videokit.LoginError) as ctx:
             videokit.login(timeout_sec=0)
         self.assertIn("could not reach the browser", str(ctx.exception))
+
+
+class LoginCommand(unittest.TestCase):
+    """The one command the user runs to get a credential.
+
+    Without an entry point the guided login is only reachable from Python, and
+    the ticket asks for a command. Ticket #20 owns the general CLI; this is the
+    single subcommand that belongs to the credential work.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        os.environ["VIDEOKIT_DATA_DIR"] = str(self.tmp)
+        self.addCleanup(os.environ.pop, "VIDEOKIT_DATA_DIR", None)
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_login_subcommand_stores_a_credential_and_reports_where(self):
+        called = []
+
+        def fake_login(**kwargs):
+            path = videokit.credentials_path()
+            videokit.save_cookies(CDP_COOKIES, path)
+            called.append(kwargs)
+            return path
+
+        original = videokit.login
+        videokit.login = fake_login
+        self.addCleanup(setattr, videokit, "login", original)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = videokit.main(["login"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(called), 1)
+        self.assertIn(str(videokit.credentials_path()), buffer.getvalue())
+
+    def test_an_unknown_subcommand_is_refused(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = videokit.main(["frobnicate"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("login", buffer.getvalue())
+
+    def test_a_failed_login_exits_nonzero_with_the_step_named(self):
+        def failing_login(**kwargs):
+            raise videokit.LoginError("chrome.exe not found at C:/nope")
+
+        original = videokit.login
+        videokit.login = failing_login
+        self.addCleanup(setattr, videokit, "login", original)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = videokit.main(["login"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("chrome.exe not found", buffer.getvalue())
 
 
 if __name__ == "__main__":

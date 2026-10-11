@@ -39,12 +39,22 @@ download_audio(url, out_dir, parts=None, cookies=None) -> list[Path]
 
 B 站字幕未登录拿不到，所以要先登录一次。取凭据由程序引导，不需要手工导出 Cookie 文件。
 
+```
+uv run --python 3.12 python videokit.py login
+```
+
+这条命令拉起浏览器窗口，扫一次码，然后把凭据落盘并打印它的路径。之后 `probe` 与两个 `download_*` 自动使用它。
+
+从 Python 里调用是同一件事。
+
 ```python
 videokit.login()             # 拉起浏览器，扫码一次，落盘凭据
 videokit.reuse_or_login()    # 已有凭据就复用，没有才拉起浏览器
 ```
 
-之后 `probe` 与两个 `download_*` 自动使用它。显式传 `cookies=` 仍然生效，优先级高于默认发现。
+显式传 `cookies=` 仍然生效，优先级高于默认发现。
+
+命令行入口目前只有 `login` 一个子命令。探测、下载、转写三块能力的命令行是 #20 的范围；这里单独有一个入口，是因为扫码这件事得能在不 import 本模块的前提下跑起来。
 
 ### 为什么必须走 CDP 导出
 
@@ -146,7 +156,7 @@ Video
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-47 项断言，约 3.5 秒，不联网、不需要登录态。
+50 项断言，约 3.5 秒，不联网、不需要登录态。
 
 跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
@@ -162,6 +172,8 @@ CDP 那一层替换的是 WebSocket 对象。`cdp_cookies(ws)` 收一个已连�
 - `netscape-reference.txt`：**这份期望值由 `yt-dlp` 自己的 Cookie 导出器写出**，是对同一次会话的独立结果。序列化测试断言逐字节相同，这样期望值不是把实现重算一遍。
 
 `LoginError` 的四种失败路径都有断言，且都用 `timeout_sec=0` 走完，所以测试不会真的等一个扫码超时。
+
+命令行入口也有断言，覆盖成功、未知子命令被拒、失败时非零退出并指出环节。
 
 ## 已知限制
 

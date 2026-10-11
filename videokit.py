@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -636,3 +637,33 @@ def download_audio(
             "--postprocessor-args", "-ar 16000 -ac 1",
         ],
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The credential command. Returns a process exit code.
+
+    Scope is deliberately one subcommand. The general CLI that exposes probe
+    and both downloads belongs to ticket #20; this exists because the scan has
+    to be reachable without importing the module.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] != ["login"]:
+        print(
+            "usage: videokit login\n\n"
+            "Log in to Bilibili once. Opens a browser window, and after the QR "
+            "code is scanned it stores a credential file that probe and the "
+            "downloads then use automatically.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        path = login()
+    except LoginError as exc:
+        print(f"login failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"credential written to {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
