@@ -1,10 +1,11 @@
 """VideoKit: probe and download Bilibili videos.
 
-Two entry points, one per input shape:
+Entry points, one per input shape:
 
-    probe(url)          -> Video                  what exists at this URL
-    download_video(...) -> list[Path]             the video files
-    download_audio(...) -> list[Path]             the audio files, for ASR
+    probe(url)                  -> Video            what exists at this URL
+    part_subtitles(url, part)   -> list[Segment]    that part's subtitle track
+    download_video(...)         -> list[Path]       the video files
+    download_audio(...)         -> list[Path]       the audio files, for ASR
 
 Why probing is its own call: deciding what to download requires knowing what
 is there first. Splitting it lets a caller ask "how many parts, which have
@@ -12,6 +13,11 @@ subtitles, what qualities" without touching the network for file data.
 
 Why audio has its own call: transcript-only work needs 40 MB per part instead
 of 130 MB or 340 MB. Same part, an order of magnitude apart.
+
+Why subtitles are their own call: a part that has a track needs no ASR at all,
+so the decision of which to run is made per part from this result. Measured on
+the first real target, 21 of 30 parts have one, and whether a part has one is
+uncorrelated with its length. So this is asked per part, never per video.
 """
 
 from __future__ import annotations
@@ -62,6 +68,27 @@ class Part:
     @property
     def has_subtitles(self) -> bool:
         return bool(self.subtitle_langs)
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One timed line of transcript.
+
+    `text` holds speech only. Timestamps are separate fields because the two
+    transcript sources disagree on granularity: platform subtitles are cut per
+    sentence, ASR can cut per word. Merged into one string, no downstream
+    consumer could treat them alike.
+
+    A note on punctuation. Bilibili's `ai-zh` tracks carry none. Measured over
+    all 21 recorded tracks, 454245 text characters, the count of CJK sentence
+    punctuation is zero, as is the count of ASCII `, ? ! ;`. The text is one
+    continuous run. This is an accepted tradeoff, not a defect, and not
+    something this module repairs.
+    """
+
+    start_sec: float
+    end_sec: float
+    text: str
 
 
 @dataclass(frozen=True)
@@ -507,6 +534,156 @@ def parse_subtitle_table(text: str) -> dict[str, tuple[str, ...]]:
         elif line.startswith("["):
             current = None
     return {k: tuple(sorted(v - _NOT_A_SUBTITLE)) for k, v in found.items()}
+
+
+_TIMESTAMP = re.compile(
+    r"^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> "
+    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})$"
+)
+
+
+def _seconds(hours: str, minutes: str, seconds: str, millis: str) -> float:
+    """One timestamp field, as seconds from the start of the track."""
+    whole = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    return whole + int(millis) / 1000
+
+
+def parse_srt(text: str) -> list[Segment]:
+    """Parse an SRT track into segments ordered by start time.
+
+    The shape is strictly four lines per block, `index / timestamp / text /
+    blank`, `4N+1` lines in total, ending in a blank line. Measured over all 21
+    recorded tracks, 40283 segments, this holds with zero exceptions: no
+    multi-line text, no empty text, no leading or trailing whitespace, and the
+    separator is always `" --> "`.
+
+    Two properties of the real data drive the implementation.
+
+    The index line is not parsed. Ten segments consist of digits alone, so
+    "an integer line" cannot be told from "an index line" by inspection. The
+    timestamp line is the anchor instead, and it is unambiguous because `-->`
+    never appears in the text.
+
+    Blank lines only delimit blocks and carry no content, so they are skipped
+    rather than used to split. That also tolerates a track that ends without a
+    final blank line, which a byte-range cut can produce.
+
+    Ordered by start time as read, which matches the source. The tracks are
+    strictly increasing in start time with no overlaps, so no sorting is
+    applied and none is needed.
+
+    An empty input yields an empty list. That is a different outcome from a
+    part that has no subtitle track, which `part_subtitles` reports by raising,
+    not by returning `[]`.
+    """
+    lines = text.split("\n")
+    segments: list[Segment] = []
+    for position, line in enumerate(lines):
+        stamp = _TIMESTAMP.match(line.rstrip("\r"))
+        if not stamp:
+            continue
+        if position + 1 >= len(lines):
+            continue  # A timestamp with no line after it is not a segment.
+        body = lines[position + 1].rstrip("\r")
+        if not body.strip():
+            continue
+        start = _seconds(*stamp.groups()[:4])
+        end = _seconds(*stamp.groups()[4:])
+        segments.append(Segment(start_sec=start, end_sec=end, text=body))
+    return segments
+
+
+class SubtitleUnavailable(VideoKitError):
+    """Raised when a part has no subtitle track to transcribe.
+
+    Deliberately not "return an empty list". The caller's two possible
+    responses are worlds apart: an empty transcript gets written to disk and
+    looks finished, while a missing track means this part needs ASR instead.
+    Raising is what keeps those apart.
+    """
+
+
+# Why the track text is read from stdout rather than from a written file.
+# yt-dlp writes subtitles to disk under a name this module cannot predict:
+# `-o` placeholders do not govern it and `--print after_move:filepath` stays
+# empty for subtitles, both measured. The `requested_subtitles` field instead
+# carries the track text itself inside the JSON dump, and for part 12 that text
+# is byte-identical to the file yt-dlp writes, sha256
+# b13447822d78f2a02fe39101a66c5b17283602fdeca82c96725e0557f224c24c, 123777
+# bytes. Reading stdout also sidesteps filename encoding entirely.
+#
+# The payload is pure ASCII because the decoder runs with ensure_ascii, so
+# Chinese text travels escaped. That matters here: `_run` decodes the
+# subprocess with the console code page on purpose, and escaped payloads are
+# immune to it.
+_SUBTITLE_PRINT_FIELD = "%(requested_subtitles)j"
+
+
+def part_subtitles(
+    url: str,
+    part: int,
+    language: str = "ai-zh",
+    cookies: Path | None = None,
+) -> list[Segment]:
+    """Fetch one part's platform subtitle track and parse it into segments.
+
+    `language` is the track language. `ai-zh` is the machine-generated Chinese
+    track, which is the only one these videos carry.
+
+    Raises `SubtitleUnavailable` when the part has no track, which is not the
+    same as a track that parses to nothing. See that exception.
+
+    No punctuation is added. Measured across all 21 recorded tracks, the CJK
+    punctuation count is zero. The returned text is one continuous run, and
+    that is the source data, not a parsing artifact.
+    """
+    payload = _run(
+        [
+            "--skip-download",
+            "--write-subs",
+            "--sub-langs", language,
+            "--sub-format", "srt",
+            "--playlist-items", str(part),
+            "--print", _SUBTITLE_PRINT_FIELD,
+            url,
+        ],
+        cookies,
+    )
+    track = _requested_track(payload, language)
+    if track is None:
+        raise SubtitleUnavailable(
+            f"part {part} has no {language!r} subtitle track"
+        )
+    segments = parse_srt(track)
+    if not segments:
+        # A track that carries no timed block is not a transcript either.
+        raise SubtitleUnavailable(
+            f"part {part} has a {language!r} track with no timed segments"
+        )
+    return segments
+
+
+def _requested_track(payload: str, language: str) -> str | None:
+    """The SRT text for `language` inside a `requested_subtitles` payload.
+
+    Absent means there is no transcribable track, and three shapes all mean
+    that. A part with no subtitles at all prints `NA`, measured on part 1 and
+    on part 6. A language the video does not carry prints `NA` too, measured by
+    asking part 12 for `zh-CN`. And a danmaku-only payload is JSON whose only
+    key is `danmaku`, which is a bullet-comment XML feed rather than a
+    subtitle.
+    """
+    try:
+        found = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(found, dict):
+        return None
+    track = found.get(language)
+    if not isinstance(track, dict):
+        return None
+    data = track.get("data")
+    return data if isinstance(data, str) and data.strip() else None
 
 
 def probe(url: str, cookies: Path | None = None) -> Video:
