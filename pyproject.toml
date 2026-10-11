@@ -1,0 +1,10 @@
+[project]
+name = "videokit"
+version = "0.1.0"
+description = "B 站视频探测、下载与转文稿"
+requires-python = ">=3.12"
+
+# websocket-client is the CDP transport. It is the only Python dependency the
+# package has; yt-dlp and ffmpeg are external programs, and funasr belongs to
+# the transcription stage rather than to this one.
+dependencies = ["websocket-client>=1.7"]

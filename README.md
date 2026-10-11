@@ -25,6 +25,8 @@ download_audio(url, out_dir, parts=None, cookies=None) -> list[Path]
 
 `parts` 是按序号选讲次，省略表示全部。
 
+`cookies` 一般不用传。登录过一次之后三个入口自己找到凭据，见下面「登录态」。
+
 ### 为什么探测要单独一个入口
 
 「先看看有什么再决定下什么」是真实用法。并进下载里，调用方就无法只问不取。
@@ -32,6 +34,65 @@ download_audio(url, out_dir, parts=None, cookies=None) -> list[Path]
 ### 为什么音频要单独一个入口
 
 同一讲，视频 130 MB 到 340 MB，音频 40 MB 左右，差一个数量级。只做文稿时不需要视频。
+
+## 登录态
+
+B 站字幕未登录拿不到，所以要先登录一次。取凭据由程序引导，不需要手工导出 Cookie 文件。
+
+```python
+videokit.login()             # 拉起浏览器，扫码一次，落盘凭据
+videokit.reuse_or_login()    # 已有凭据就复用，没有才拉起浏览器
+```
+
+之后 `probe` 与两个 `download_*` 自动使用它。显式传 `cookies=` 仍然生效，优先级高于默认发现。
+
+### 为什么必须走 CDP 导出
+
+程序无法直接读浏览器的 Cookie 库。本机实测四种方式全部失败，记录在 `docs/research/measured-bilibili-subtitle-availability.md`。
+
+| 方式 | 结果 |
+|---|---|
+| `yt-dlp --cookies-from-browser chrome` | `Could not copy Chrome cookie database`，数据库被进程锁住 |
+| `yt-dlp --cookies-from-browser edge` | `Failed to decrypt with DPAPI`，新版 Chromium app-bound 加密 |
+| `chrome-agent --copy-cookies` | `Chrome cookies file not found`，它查旧路径 `Default\Cookies`，实际在 `Default\Network\Cookies` |
+| robocopy 备份语义复制 | 退出码 16，文件锁未绕过 |
+
+所以路径是：程序拉起一个带远程调试端口的 Chrome，用户在其中扫码，程序通过 CDP 取 Cookie 落盘。
+
+### 两个必须的 CDP 细节
+
+漏掉任何一个都不报错，只是拿到 0 条 Cookie。这与「登录态过期」表现完全一样，所以没有测试覆盖就会静默失败。
+
+- **必须附着到 bilibili 的 page target，且先发 `Network.enable`。** 附着到浏览器级 WebSocket 直接问，返回 0 条。
+- **Chrome 启动必须带 `--remote-allow-origins=*`。** Chrome 111 起默认拒绝带 Origin 头的 CDP 连接，报 403，看起来像网络问题而不是缺参数。
+
+这两条都落在 `videokit.chrome_argv` 与 `videokit.cdp_cookies`，测试直接对着断言。
+
+### 凭据文件的位置与权限
+
+凭据落在仓库之外的数据目录，默认 `%LOCALAPPDATA%\VideoKit\cookies.txt`。落盘时降权到只有当前账户可读写，文件与它所在的目录都降。
+
+**放进仓库是不允许的，这一条编码成结构而不是靠记忆。** 两道独立的防线：
+
+- 路径在仓库工作区之外，就地放进仓库这个错误本身不可用。
+- `.gitignore` 里有 `cookies.txt` 与 `*cookies*.txt`，万一有人手工复制进来，`git check-ignore` 仍然拦住。
+
+`VIDEOKIT_DATA_DIR` 可覆盖数据目录，测试靠它保持隔离。
+
+### profile 复用
+
+浏览器 profile 落在数据目录下的 `browser-profile`。登录态跟着 profile 走，重启浏览器后仍然有效，所以扫码是一次性的。
+
+### 导出失败时报的是哪一步
+
+`LoginError` 的文案指出失败的环节，四种情况分开。
+
+- 找不到 `chrome.exe`，报查过的路径。
+- 远程调试端口连不上，报 URL 与原因。
+- 没有 page target 可附着，报 Chrome 报了几个 target。
+- Cookie 拿到了但没有 `SESSDATA`，报用户需要扫码。
+
+最后一种最需要区分。匿名 profile 也会返回一堆 Cookie，只看「拿到的 Cookie 是否非空」会把未登录判成已登录。
 
 ## 数据结构
 
@@ -85,13 +146,31 @@ Video
 uv run --python 3.12 python test/test_videokit.py
 ```
 
-20 项断言。跑真实模块，**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
+47 项断言，约 3.5 秒，不联网、不需要登录态。
 
-夹具在 `test/fixtures/`，含三种真实输入：30 讲合集的字幕表与 JSON、5 讲视频的字幕表、单视频的字幕表。用真字节而不是手工样本，因为要防的正是真实格式的变化。
+跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
-测试不依赖网络和登录态，换台机器也能跑。
+凭据与默认发现这一层换了个接缝。**测试替换 `subprocess.run` 而不是 `_run`**，因为要断言的正是「命令行里到底有没有 `--cookies`」。替换 `_run` 就看不到这一点。
+
+CDP 那一层替换的是 WebSocket 对象。`cdp_cookies(ws)` 收一个已连接的 socket，所以「先 `Network.enable` 再 `Network.getAllCookies`」这条顺序可以在没有浏览器的前提下定死。
+
+夹具在 `test/fixtures/`，全部是真实录制的字节。
+
+- `dump-multipart.json`、`list-subs-multipart.txt`、`list-subs-single.txt`：`yt-dlp` 的真实输出。
+- `cdp-cookies.json`：真实 Chrome 的 `Network.getAllCookies` 回包，36 条，Cookie 值已抹掉，其余字段是浏览器原样报的。
+- `cdp-targets.json`：真实 `/json/list` 回包，含非 page target 与另一个站点的 page，所以「选了第一个」和「选对了」能区分开。
+- `netscape-reference.txt`：**这份期望值由 `yt-dlp` 自己的 Cookie 导出器写出**，是对同一次会话的独立结果。序列化测试断言逐字节相同，这样期望值不是把实现重算一遍。
+
+`LoginError` 的四种失败路径都有断言，且都用 `timeout_sec=0` 走完，所以测试不会真的等一个扫码超时。
 
 ## 已知限制
+
+**环境变量 `PYTHONIOENCODING` 会让 `probe` 崩。** 实测，与本 ticket 无关，主检出同样复现。
+
+- 不设时，`yt-dlp` 按 cp936 写 stdout，父进程也按 cp936 解，正常。
+- 设为 `utf-8` 时，`yt-dlp` 改成写 UTF-8，父进程仍按 cp936 解，于是 `_run` 抛 `UnicodeDecodeError`，`probe` 下一步拿到 `None` 再崩在 `parse_subtitle_table`。
+
+根因是 `_run` 让平台决定编码，而 `PYTHONIOENCODING` 只影响子进程、不影响父进程的解码，两边就此不一致。修法不在本 ticket 范围内，记在这里以免下次当成新 bug 查。跑本包时不要设这个变量。
 
 **三个曾经漏掉的 bug 说明测试的边界在哪。** 早期版本 20 项测试全过但真实调用立刻崩，因为三个问题全在 `_run` 及其返回值上，而测试把它替换掉了：`yt-dlp` 不在 PATH 上、下载返回空列表、中文路径烂掉。
 
@@ -103,13 +182,19 @@ uv run --python 3.12 python test/test_videokit.py
 
 **只做 B 站。** 其他站点未测。
 
+**扫码超时默认 180 秒。** 超时后报「没检测到登录」，浏览器窗口会被关掉。重新跑一次即可。
+
 ## 依赖
+
+Python 侧只有 `websocket-client`，用于 CDP，写在 `pyproject.toml` 里。
 
 `yt-dlp` 与 `ffmpeg` 是两个外部程序，都不是 Python 包。
 
 `yt-dlp` 优先用 PATH 上的，找不到就回退到 `uv tool run --from yt-dlp yt-dlp`。两者都没有时抛出带安装指引的错误。
 
 `ffmpeg` 需要已经在 PATH 上。Windows 可用 `winget install Gyan.FFmpeg`。
+
+Chrome 用于引导式登录。找不到时 `login()` 报出查过的路径，也可以显式传 `chrome=`。
 
 ## 相关
 

@@ -1,0 +1,22 @@
+[
+  {
+    "type": "page",
+    "url": "https://www.bilibili.com/",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9232/devtools/page/CB8D092E3F1721E21040C5B134561C64"
+  },
+  {
+    "type": "browser_ui",
+    "url": "chrome://omnibox-popup.top-chrome/",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9232/devtools/page/DF406FBCF27DCE569091F9B843E3D3EB"
+  },
+  {
+    "type": "browser_ui",
+    "url": "chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9232/devtools/page/0625A5842C17B2B4037D57053D495B10"
+  },
+  {
+    "type": "service_worker",
+    "url": "chrome-extension://nkeimhogjdpnpccoofpliimaahmaaome/thunk.js",
+    "webSocketDebuggerUrl": "ws://127.0.0.1:9232/devtools/page/74E7601D20CD5B5C2C78B825939805C1"
+  }
+]
