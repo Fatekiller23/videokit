@@ -907,8 +907,13 @@ def transcript_text(segments: Iterable[Segment]) -> str:
     return "".join(pieces)
 
 
-def transcript_filename(record: PartTranscript) -> str:
-    """The delivered file's name, ordered by part.
+def delivered_name(index: int, title: str) -> str:
+    """The name a delivered artifact carries, from the two fields that set it.
+
+    Takes the index and title rather than a record because the skip pre-check
+    has to name an artifact before any transcript record exists for it. One
+    function builds the name for both paths, so the file the pre-check probes
+    and the file `write_transcript` produces cannot disagree.
 
     The index prefix is what makes a directory listing read in course order,
     because every title begins with the course name rather than with its own
@@ -920,8 +925,18 @@ def transcript_filename(record: PartTranscript) -> str:
     not a repair.
     """
     unsafe = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-    title = unsafe.sub("_", record.title).strip().rstrip(".")
-    return f"{record.index:02d}-{title}.txt"
+    safe = unsafe.sub("_", title).strip().rstrip(".")
+    return f"{index:02d}-{safe}.txt"
+
+
+def transcript_filename(record: PartTranscript) -> str:
+    """The delivered file's name for one record."""
+    return delivered_name(record.index, record.title)
+
+
+def transcript_path(out_dir: Path, index: int, title: str) -> Path:
+    """Where this part's delivered artifact belongs, without writing it."""
+    return Path(out_dir) / delivered_name(index, title)
 
 
 def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
@@ -933,12 +948,115 @@ def write_transcript(record: PartTranscript, out_dir: Path) -> Path:
     A `pending` record has no transcript to write. Writing an empty file for
     one would look finished, which is the outcome `SubtitleUnavailable` exists
     to prevent, so callers must not ask.
+
+    **The payload is built in full, written to a neighbouring temporary file,
+    then swapped into place.** `Path.write_text` opens the target with mode `w`,
+    which truncates it before writing anything, so an interruption in between
+    leaves a short file under the delivered name. Measured on this machine, a
+    finished 1500 byte artifact became zero bytes when the rewrite failed at
+    the encode step, and the same thing happens to a process killed mid-write.
+    After this change an interruption leaves either the old artifact untouched
+    or no file at all, never a plausible fragment. That matters more since the
+    skip check reads the artifact to decide whether to trust it: a truncated
+    file is exactly the shape the check has to judge, and this keeps the module
+    from being the thing that creates one.
+
+    The temporary file is a sibling, not a file in the system temp directory.
+    `os.replace` is only atomic within one filesystem, and a temp directory is
+    often on another, where the call degrades to a copy and the atomicity goes
+    away.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / transcript_filename(record)
-    path.write_text(transcript_text(record.segments), encoding="utf-8")
+    path = transcript_path(out_dir, record.index, record.title)
+    payload = transcript_text(record.segments)
+    # Encoded before the temporary file exists, so a payload that cannot be
+    # encoded fails with the previous artifact still in place.
+    data = payload.encode("utf-8")
+    staging = path.with_name(f".{path.name}.partial")
+    try:
+        staging.write_bytes(data)
+        os.replace(staging, path)
+    finally:
+        # A crash cannot reach this, but a failed `os.replace` can, and a
+        # leftover working file would sit in the output directory looking like
+        # an artifact to anything that globs it.
+        staging.unlink(missing_ok=True)
     return path
+
+
+# The lowest density a finished transcript can have and still be called
+# finished. Measured over the 30 delivered artifacts of the first real course,
+# the range is 4.239 characters per second of probed part duration on part 30
+# to 5.418 on part 23, a spread of 1.28 times across parts of one course, so
+# the floor is deliberately not set at the observed low end. A floor above a
+# real part's density would re-transcribe a finished part, which costs minutes;
+# the floor below accepts a file that is only grossly short, which is what the
+# atomic write in `write_transcript` exists to make impossible in the first
+# place. 3.0 carries no false rejection on any of the 30 measured artifacts and
+# rejects the measured half file at 2.701.
+_MIN_CHARS_PER_SEC = 3.0
+
+
+def _skipped_record(part: Part, bvid: str) -> PartTranscript:
+    """The record for a part whose artifact was already on disk.
+
+    Carries no segments. It could read them back, but nothing consumes them
+    here: the delivered file is the artifact, the run does not rewrite it, and
+    reading a 50 KB file per skipped part to fill a field nobody asks for is
+    work without a reader. `status` is what the summary and the caller go on.
+
+    `skipped` is a fourth value beyond the spec's `ok` / `failed`, alongside
+    the `pending` this module already adds. A skipped part is `ok` in the sense
+    that its transcript exists, and it is deliberately not recorded as `ok`
+    because that would count it among the parts this run produced. The ticket
+    asks for exactly that separation.
+    """
+    return PartTranscript(
+        bvid=bvid,
+        index=part.index,
+        title=part.title,
+        duration_sec=part.duration_sec,
+        source=None,
+        language=None,
+        segments=(),
+        status="skipped",
+    )
+
+
+def transcript_complete(path: Path, duration_sec: float) -> bool:
+    """Whether the artifact at `path` is a finished transcript for this part.
+
+    Existence alone cannot answer this. The delivered file is continuous UTF-8
+    text with no trailing newline and no end marker, so a file left by an
+    interrupted write is a clean prefix of the real thing and looks like a
+    transcript from the outside. Treating one as finished loses the content
+    that never got written and never says so, which is the failure this
+    function exists to prevent.
+
+    The file must decode as strict UTF-8. Every artifact is UTF-8 Chinese, so
+    most of its bytes are the leading or continuation byte of a three byte
+    character. Cutting the stream at an arbitrary offset therefore usually
+    splits one, and measured over 30 real artifacts at 11 cut points, 223 of
+    330 arbitrary byte cuts raise UnicodeDecodeError.
+
+    The remaining 107 cuts land on a character boundary and decode cleanly, so
+    decoding is not enough on its own. Measured on part 23 cut at byte 25591,
+    the half file is 8537 clean characters and reads as a transcript. The
+    second check is therefore length against the probed duration: a finished
+    artifact carries at least `_MIN_CHARS_PER_SEC` characters per second of its
+    part, and an interrupted one carries a fraction of that.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not text.strip():
+        return False
+    return len(text) >= _MIN_CHARS_PER_SEC * duration_sec
 
 
 def _pending_record(bvid: str, part: Part) -> PartTranscript:
@@ -1237,6 +1355,18 @@ def transcripts(
     holder = engine if engine is not None else _DeferredEngine(device)
     records: list[PartTranscript] = []
     for part in selected:
+        # The pre-check. A finished artifact means no work at all for this
+        # part: no subtitle fetch, no audio download, no model call. This is
+        # what makes a second run over a nearly complete course fast, and it
+        # is the only persistence the spec allows.
+        #
+        # It reads the artifact rather than trusting that the name exists,
+        # because an interrupted write leaves a clean prefix of a real
+        # transcript under the real name. See `transcript_complete`.
+        existing = transcript_path(out_dir, part.index, part.title)
+        if transcript_complete(existing, part.duration_sec):
+            records.append(_skipped_record(part, video.id))
+            continue
         record = part_transcript(
             video,
             part,
@@ -1246,10 +1376,9 @@ def transcripts(
             device=device,
         )
         if record.status == "ok":
-            # Guard kept for ticket #18 and #19. A record that is not `ok` has
-            # no transcript to write, and an empty file for one would read as
-            # finished. Once #18 produces `failed` records, this same check is
-            # what keeps them from leaving a misleading file behind.
+            # Guard kept for ticket #18. A record that is not `ok` has no
+            # transcript to write, and an empty file for one would read as
+            # finished.
             write_transcript(record, out_dir)
         records.append(record)
     return tuple(records)
@@ -1356,16 +1485,22 @@ def download_audio(
 def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
     """The line printed after a batch, naming what was produced and from where.
 
-    The source split is the point of the line. A part filled by ASR and a part
-    taken from a platform track produce files that read differently, so a
-    reader who saw only "30 of 30" would not know how much of the course was
-    machine-transcribed. The `pending` count stays for the case ticket #18
+    The source split is the point of the first two lines. A part filled by ASR
+    and a part taken from a platform track produce files that read differently,
+    so a reader who saw only "30 of 30" would not know how much of the course
+    was machine-transcribed. The `pending` count stays for the case ticket #18
     will produce, a part that could not be transcribed at all.
+
+    Skipped parts are counted on their own line and named. They are excluded
+    from the delivered count because they were not produced by this run; a
+    second pass over a course that is already 29 parts done would otherwise
+    read as "29 of 30", which is the opposite of what happened.
     """
     records = list(records)
     delivered = [r for r in records if r.status == "ok"]
     platform = [r for r in delivered if r.source == "platform"]
     asr = [r for r in delivered if r.source == "asr"]
+    skipped = [r for r in records if r.status == "skipped"]
     pending = [r for r in records if r.status == "pending"]
     failed = [r for r in records if r.status == "failed"]
     lines = [
@@ -1376,6 +1511,11 @@ def transcript_report(records: Iterable[PartTranscript], out_dir: Path) -> str:
             f"{len(platform)} from platform subtitles, "
             f"{len(asr)} from ASR"
             + (f" (parts {', '.join(str(r.index) for r in asr)})" if asr else "")
+        )
+    if skipped:
+        lines.append(
+            f"skipped {len(skipped)} parts already delivered "
+            f"(parts {', '.join(str(r.index) for r in skipped)})"
         )
     if pending:
         lines.append(

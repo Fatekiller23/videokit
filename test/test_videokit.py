@@ -1545,6 +1545,430 @@ class DeliverableFiles(unittest.TestCase):
         self.assertEqual(path.parent, self.out)
 
 
+# Part 23's delivered artifact, byte for byte. The committed ASR fixture is
+# that same file: 51185 bytes, 17123 characters, sha256
+# d1f57fbeee2c9bdb0cafa79bdfb7da6497458e52da476e761e3227e22d2c5a7c, which is
+# what `.wayfinder-scratch/e2e-17/transcripts/23-….txt` holds. Its probed
+# duration is 3160.212 seconds, so a finished artifact of this course carries
+# 5.418 characters per second of its part.
+PART23_SECONDS = 3160.212
+PART23_CHARS = 17123
+
+# Part 30's probed duration, and the character count of its delivered artifact.
+# It is the slowest part of the course at 4.239 characters per second, so it is
+# the artifact that decides how low the completeness floor may sit.
+PART30_SECONDS = 5761.01
+PART30_CHARS = 24423
+
+# Characters per second of part, measured over all 30 delivered artifacts of
+# the #17 real run. The low end is 4.239 on part 30 and the high end is 5.418
+# on part 23, a spread of 1.28 times. A previous run's artifact is judged
+# against the duration a fresh probe reports, and this band is why the floor
+# `transcript_complete` uses sits below 4.239 rather than at it.
+DELIVERED_MIN_RATE = 4.239
+DELIVERED_MAX_RATE = 5.418
+DELIVERED_MEAN_RATE = 4.8
+
+
+def delivered_text(duration_sec: float) -> str:
+    """Text with the shape a finished run leaves for a part of this length.
+
+    Built from the real part 23 transcript at the measured mean density rather
+    than from hand-written filler, so a fixture artifact has the order of size
+    a real run produces. Length is the property under test here.
+    """
+    target = int(DELIVERED_MEAN_RATE * duration_sec)
+    repeats = -(-target // len(ASR_TEXT))
+    return (ASR_TEXT * repeats)[:target]
+
+
+class TranscriptCompleteness(unittest.TestCase):
+    """Whether a delivered artifact is finished, decided by reading it.
+
+    The delivered file is continuous UTF-8 text with no trailing newline and no
+    end marker, so nothing inside it says "this is all of it". A file left by
+    an interrupted write is therefore a clean prefix of the real thing, and the
+    only signals available are that it decodes and that it is long enough for
+    the part it belongs to. Both are measured in the tests below.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.artifact = self.tmp / "23-artifact.txt"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_a_real_delivered_artifact_is_complete(self):
+        # The real file itself, not a sample of it, judged against the duration
+        # the probe reports for that part.
+        self.artifact.write_bytes(ASR_TEXT.encode("utf-8"))
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART23_SECONDS), True
+        )
+
+    def test_an_interrupted_write_is_not_complete(self):
+        # Half of the real artifact, cut at a character boundary so it decodes
+        # as clean UTF-8 and reads as a transcript. Measured: the first 25591
+        # bytes are 8537 characters, or 2.701 characters per second of part 23,
+        # against 4.239 to 5.418 for the 30 finished artifacts. Decoding alone
+        # accepts this file, and accepting it loses 8586 characters.
+        data = ASR_TEXT.encode("utf-8")
+        half = data[:25591]
+        self.assertEqual(len(half), 25591)  # A clean boundary, not a torn one.
+        self.assertEqual(len(half.decode("utf-8")), 8537)
+        self.artifact.write_bytes(half)
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART23_SECONDS), False
+        )
+
+
+    def test_a_torn_file_is_not_complete(self):
+        # The other half of the 330 measured cuts: this one splits a three byte
+        # character, so the file is not even valid text.
+        data = ASR_TEXT.encode("utf-8")
+        torn = data[:25592]
+        with self.assertRaises(UnicodeDecodeError):
+            torn.decode("utf-8")
+        self.artifact.write_bytes(torn)
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART23_SECONDS), False
+        )
+
+    def test_an_absent_artifact_is_not_complete(self):
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART23_SECONDS), False
+        )
+
+    def test_an_empty_artifact_is_not_complete(self):
+        self.artifact.write_bytes(b"")
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART23_SECONDS), False
+        )
+
+    def test_the_lowest_real_density_in_the_course_still_counts_as_complete(self):
+        # Part 30 delivered 24423 characters over 5761.01 seconds, 4.239
+        # characters per second, the lowest of the 30 artifacts. The floor has
+        # to sit below this or a finished part is re-transcribed next run.
+        slowest = (ASR_TEXT * 2)[:PART30_CHARS]
+        self.assertEqual(len(slowest), 24423)
+        self.assertEqual(round(len(slowest) / PART30_SECONDS, 3), 4.239)
+        self.artifact.write_bytes(slowest.encode("utf-8"))
+        self.assertEqual(
+            videokit.transcript_complete(self.artifact, PART30_SECONDS), True
+        )
+
+    def test_a_zero_duration_part_is_still_judged_on_its_bytes(self):
+        # A part the probe reports as zero seconds long has no duration to
+        # measure against, so the length check alone would accept anything.
+        # The decode check still applies, and that is what keeps a torn file
+        # from passing when the duration is missing.
+        self.artifact.write_bytes("政策是很重要的".encode("utf-8"))
+        self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), True)
+        self.artifact.write_bytes(ASR_TEXT.encode("utf-8")[:25592])
+        self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), False)
+
+
+class SkipExisting(unittest.TestCase):
+    """A part whose artifact is already on disk is not processed again.
+
+    The seam is the same one `BatchRun` uses: `_run` and the engine. A skipped
+    part must produce no subtitle fetch, no audio download and no engine call,
+    and the run must still probe, because the probe result is never persisted.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+        self.original_engine = videokit.load_engine
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
+        self.loads: list[str] = []
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return stub_run(str(self.audio / f"{part:02d}.wav"))
+            if part in PARTS_WITH_SUBTITLES:
+                return stub_run(SUB_PRINT_PART)
+            return stub_run(SUB_PRINT_NO_TRACK)
+
+        videokit._run = fake_run
+        videokit.load_engine = lambda device="cpu": self.loads.append(device) or self.engine
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.addCleanup(setattr, videokit, "load_engine", self.original_engine)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+        self.audio = self.tmp / "audio"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _titles(self) -> dict[int, str]:
+        """Each part's title, read off the recorded probe dump."""
+        dump = json.loads(MULTI_DUMP)
+        entries = dump.get("entries") or [dump]
+        return {e["playlist_index"] or 1: e["title"] for e in entries}
+
+    def _place(self, index: int, text: str) -> Path:
+        """Put finished text where the delivered artifact for a part belongs.
+
+        The name is built here from the index and the title rather than by
+        calling `transcript_filename`, so the test does not agree with the
+        implementation by construction.
+        """
+        self.out.mkdir(parents=True, exist_ok=True)
+        path = self.out / f"{index:02d}-{self._titles()[index]}.txt"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _run_all(self, parts: list[int] | None = None, out: Path | None = None):
+        return videokit.transcripts(
+            "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+            out or self.out,
+            parts=parts,
+            audio_dir=self.audio,
+        )
+
+    def _fetches(self) -> list[list[str]]:
+        """The `_run` calls that are neither of the two probe calls."""
+        return [
+            a for a in self.calls
+            if "--dump-single-json" not in a and "--list-subs" not in a
+        ]
+
+    def test_a_part_whose_artifact_is_complete_is_not_processed_again(self):
+        self._place(23, ASR_TEXT)
+        records = self._run_all(parts=[23])
+        self.assertEqual([r.status for r in records], ["skipped"])
+        # No subtitle fetch, no audio download, no engine call.
+        self.assertEqual(self._fetches(), [])
+        self.assertEqual(self.loads, [])
+        self.assertEqual(self.engine.calls, [])
+
+    def test_a_complete_part_is_skipped_alongside_parts_that_are_processed(self):
+        self._place(23, ASR_TEXT)
+        records = self._run_all(parts=[3, 23])
+        self.assertEqual([r.index for r in records], [3, 23])
+        self.assertEqual([r.status for r in records], ["ok", "skipped"])
+        # Part 3 has a track, so exactly one fetch happened and it was part 3.
+        self.assertEqual(
+            [a[a.index("--playlist-items") + 1] for a in self._fetches()], ["3"]
+        )
+
+    def test_the_skip_leaves_the_existing_artifact_untouched(self):
+        path = self._place(23, ASR_TEXT)
+        before = path.stat().st_mtime_ns
+        self._run_all(parts=[23])
+        self.assertEqual(path.read_text(encoding="utf-8"), ASR_TEXT)
+        self.assertEqual(path.stat().st_mtime_ns, before)
+
+    def test_a_half_written_artifact_is_processed_again(self):
+        # The subtle half of the ticket. This file decodes as clean UTF-8 and
+        # reads like a transcript, so "the name exists" would call it finished
+        # and silently keep 8586 characters short of the real thing.
+        half = ASR_TEXT.encode("utf-8")[:25591]
+        self.assertEqual(len(half.decode("utf-8")), 8537)
+        path = self._place(23, half.decode("utf-8"))
+        records = self._run_all(parts=[23])
+        self.assertEqual([r.status for r in records], ["ok"])
+        # A rewritten file is the evidence it was reprocessed, and the audio
+        # download is the evidence the ASR path really ran.
+        self.assertEqual(path.read_text(encoding="utf-8"), ASR_TEXT)
+        self.assertEqual(
+            [a[a.index("--playlist-items") + 1] for a in self._fetches()], ["23"]
+        )
+        self.assertEqual(len(self.engine.calls), 1)
+
+    def test_a_torn_artifact_is_processed_again(self):
+        path = self._place(23, "ignored")
+        path.write_bytes(ASR_TEXT.encode("utf-8")[:25592])
+        records = self._run_all(parts=[23])
+        self.assertEqual([r.status for r in records], ["ok"])
+        self.assertEqual(path.read_text(encoding="utf-8"), ASR_TEXT)
+
+    def test_the_run_probes_again_even_when_every_part_is_skipped(self):
+        # The spec's one explicit exclusion. The probe result is not persisted,
+        # so a run that skips every part still probes. Measured at about 38
+        # seconds for 30 parts, which is cheaper than state that can go stale.
+        self._place(23, ASR_TEXT)
+        before = len(self.calls)
+        self._run_all(parts=[23])
+        probed = [a for a in self.calls[before:] if "--dump-single-json" in a]
+        self.assertEqual(len(probed), 1)
+        listed = [a for a in self.calls[before:] if "--list-subs" in a]
+        self.assertEqual(len(listed), 1)
+
+    def test_two_runs_leave_no_state_behind_in_the_output_directory(self):
+        # The only thing persisted is the artifact itself. A state file beside
+        # it would be the caching the spec rules out.
+        self._place(23, ASR_TEXT)
+        self._run_all(parts=[23])
+        self.assertEqual(
+            sorted(p.name for p in self.out.iterdir()),
+            [f"23-{self._titles()[23]}.txt"],
+        )
+
+
+class TranscriptReport(unittest.TestCase):
+    """The line printed after a batch, which must separate the two populations.
+
+    A reader coming back to finish a nearly complete course needs to see that
+    most parts were already done and only a few were produced now. Counting
+    both as "delivered" would hide that.
+    """
+
+    def _record(self, index: int, status: str, source: str | None = "platform"):
+        return videokit.PartTranscript(
+            bvid="BV1Y5QgB5Eas",
+            index=index,
+            title=f"{index:02d}-t",
+            duration_sec=100.0,
+            source=source,
+            language="ai-zh" if source else None,
+            segments=(),
+            status=status,
+        )
+
+    def test_skipped_parts_are_counted_apart_from_this_run_s_parts(self):
+        report = videokit.transcript_report(
+            [
+                self._record(1, "skipped", None),
+                self._record(2, "skipped", None),
+                self._record(3, "ok"),
+            ],
+            Path("out"),
+        )
+        self.assertIn("skipped 2", report)
+        self.assertIn("delivered 1", report)
+
+    def test_the_skipped_parts_are_named_so_the_reader_can_check_them(self):
+        report = videokit.transcript_report(
+            [self._record(18, "skipped", None), self._record(23, "skipped", None)],
+            Path("out"),
+        )
+        self.assertIn("18", report)
+        self.assertIn("23", report)
+
+
+class AtomicWrite(unittest.TestCase):
+    """The delivered name only ever holds a finished artifact.
+
+    `Path.write_text` opens the target with mode `w`, which truncates it before
+    a byte of the new payload is written. Measured on this machine, a finished
+    1500 byte artifact is left at zero bytes when the rewrite fails at the
+    encode step, and a process killed mid-write leaves the same thing. That is
+    the file `transcript_complete` then has to guess about. Making the write a
+    build-then-swap means the guess is only ever about a foreign file, not one
+    this module just created.
+
+    The crash is produced in a child process at the swap syscall, which is the
+    one place a real interruption can land between "the payload is on disk" and
+    "the payload is the delivered file".
+    """
+
+    CRASH_AT_SWAP = """
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import videokit
+out = sys.argv[2]
+record = videokit.PartTranscript(
+    bvid="BV1Y5QgB5Eas", index=23, title="23-crash", duration_sec=1.0,
+    source="asr", language="zh",
+    segments=(videokit.Segment(0.0, 1.0, "政策很重要" * 400),), status="ok",
+)
+os.replace = lambda src, dst: os._exit(7)
+videokit.write_transcript(record, out)
+raise SystemExit(0)  # Reached only if the write never swapped.
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+        self.out.mkdir(parents=True)
+        self.package = str(Path(__file__).resolve().parent.parent)
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _crash(self) -> int:
+        done = subprocess.run(
+            [sys.executable, "-c", self.CRASH_AT_SWAP, self.package, str(self.out)],
+            capture_output=True,
+        )
+        return done.returncode
+
+    def test_an_interrupted_write_leaves_nothing_at_the_delivered_name(self):
+        # A hard kill at the swap cannot run cleanup, so the working file stays.
+        # What matters is that nothing sits at the delivered name, and that the
+        # leftover is the same path every time, so a later run consumes it by
+        # swapping over it. One working file per part, never a growing pile.
+        self.assertEqual(self._crash(), 7)
+        self.assertEqual([p.name for p in self.out.iterdir()],
+                         [".23-23-crash.txt.partial"])
+        self.assertFalse((self.out / "23-23-crash.txt").exists())
+
+    def test_the_working_file_is_not_mistaken_for_an_artifact(self):
+        # The leftover is dot-prefixed and carries a `.partial` suffix, so a
+        # later run's skip check, which probes the delivered name exactly,
+        # cannot see it.
+        self._crash()
+        self.assertEqual(
+            videokit.transcript_complete(self.out / "23-23-crash.txt", 300.0),
+            False,
+        )
+
+    def test_an_interrupted_write_does_not_destroy_the_previous_artifact(self):
+        # The delivered file exists and is finished. A crash during the rewrite
+        # must leave it as it was, because the alternative is a zero byte file
+        # under a name that looks delivered.
+        path = self.out / "23-23-crash.txt"
+        path.write_text(delivered_text(300.0), encoding="utf-8")
+        before = path.read_bytes()
+        self.assertEqual(self._crash(), 7)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(videokit.transcript_complete(path, 300.0))
+
+    def test_a_successful_write_leaves_no_working_file_behind(self):
+        record = videokit.PartTranscript(
+            bvid="BV1Y5QgB5Eas", index=23, title="23-crash", duration_sec=1.0,
+            source="asr", language="zh",
+            segments=(videokit.Segment(0.0, 1.0, "政策很重要"),), status="ok",
+        )
+        path = videokit.write_transcript(record, self.out)
+        self.assertEqual(path.read_text(encoding="utf-8"), "政策很重要")
+        self.assertEqual([p.name for p in self.out.iterdir()], ["23-23-crash.txt"])
+
+    def test_a_payload_that_cannot_be_encoded_leaves_the_artifact_alone(self):
+        # Measured: the old in-place write truncated a finished artifact to
+        # zero bytes and then raised.
+        path = self.out / "23-23-crash.txt"
+        path.write_text("政策是很重要的", encoding="utf-8")
+        record = videokit.PartTranscript(
+            bvid="BV1Y5QgB5Eas", index=23, title="23-crash", duration_sec=1.0,
+            source="asr", language="zh",
+            # A lone surrogate is not encodable as UTF-8.
+            segments=(videokit.Segment(0.0, 1.0, "政策\ud800"),), status="ok",
+        )
+        with self.assertRaises(UnicodeEncodeError):
+            videokit.write_transcript(record, self.out)
+        self.assertEqual(path.read_text(encoding="utf-8"), "政策是很重要的")
+        self.assertEqual([p.name for p in self.out.iterdir()], ["23-23-crash.txt"])
+
+
 class BatchRun(unittest.TestCase):
     """One command, one BV number, every part judged, none of them fatal.
 
