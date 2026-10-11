@@ -2320,5 +2320,724 @@ class AsrDependencies(unittest.TestCase):
         self.assertIn("punctuation", source)
 
 
+# --- Ticket #20: the command line entry point -----------------------------
+
+# The premium-tier line, recorded live from `yt-dlp --list-subs` on
+# BV1Y5QgB5Eas with a working credential. It is a separate fixture because the
+# older `list-subs-*.txt` files store the tier name as six U+FFFD replacement
+# characters, so the real name cannot be asserted against them.
+#
+# The measured stream matters and is counter to the reconnaissance note: on
+# this machine yt-dlp writes this line to **stdout**, not stderr. Captured with
+# `subprocess.run(capture_output=True)` into separate files, the logged-in
+# `--list-subs` run produced 30 of these on stdout and 0 bytes on stderr. The
+# stderr copy that the note describes belongs to the logged-out run, whose
+# stderr carries the login warning instead. The CLI therefore scans both
+# streams rather than one.
+PREMIUM_LINE = (
+    FIXTURES / "list-subs-premium-line.txt"
+).read_text(encoding="utf-8")
+
+# The recorded subtitle table with its mangled premium lines removed. Used
+# where the premium signal is not what is under test, so the assertions do not
+# depend on a fixture whose tier name is unreadable.
+SUBS_TABLE = "\n".join(
+    line for line in MULTI_SUBS.splitlines() if "Format(s)" not in line
+)
+
+
+class DownloadProgress(unittest.TestCase):
+    """`videokit video` and `videokit audio` report per part as they go.
+
+    The ticket asks for progress that is visible rather than a long silence,
+    because one part is minutes of waiting. Nothing here claims a percentage:
+    the download path reports only the files yt-dlp says it finished, so the
+    count of finished parts is the only progress figure that is measurable, and
+    that is what is printed.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            if "--list-subs" in args:
+                return videokit.RunOutput(SUBS_TABLE, "")
+            part = args[args.index("--playlist-items") + 1]
+            return videokit.RunOutput(str(self.tmp / f"{part}.bin"), "")
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "out"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = videokit.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _finished_lines(self, printed: str) -> list[str]:
+        """The lines reporting a part that finished, one per written file."""
+        return [l for l in printed.splitlines() if "完成" in l and "[" in l]
+
+    def test_audio_reports_one_line_per_selected_part(self):
+        code, printed, err = self._run_main(
+            ["audio", "BV1Y5QgB5Eas", "--parts", "1,6", "--out", str(self.out)]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self._finished_lines(printed)), 2)
+
+    def test_audio_progress_names_the_part_and_the_total(self):
+        _, printed, _ = self._run_main(
+            ["audio", "BV1Y5QgB5Eas", "--parts", "1,6", "--out", str(self.out)]
+        )
+        self.assertIn("[1/2]", printed)
+        self.assertIn("[2/2]", printed)
+
+    def test_video_progress_reports_each_part_it_wrote(self):
+        code, printed, err = self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--parts", "3,4", "--out", str(self.out)]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("[1/2]", printed)
+        self.assertIn("[2/2]", printed)
+        self.assertIn("2", printed)
+
+    def test_video_passes_the_quality_selector_through(self):
+        self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--parts", "3", "--quality", "1080p",
+             "--out", str(self.out)]
+        )
+        downloads = [a for a in self.calls if "-f" in a]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(downloads[0][downloads[0].index("-f") + 1], "30080+30280")
+
+    def test_the_audio_command_asks_for_the_asr_format(self):
+        self._run_main(["audio", "BV1Y5QgB5Eas", "--parts", "6", "--out", str(self.out)])
+        downloads = [a for a in self.calls if "--audio-format" in a]
+        self.assertEqual(len(downloads), 1)
+        self.assertIn("16000", " ".join(downloads[0]))
+
+    def test_an_unknown_quality_is_refused_and_the_valid_ones_named(self):
+        code, out, err = self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--quality", "4320p", "--out", str(self.out)]
+        )
+        self.assertNotEqual(code, 0)
+        printed = out + err
+        self.assertIn("4320p", printed)
+        self.assertIn("1080p", printed)
+
+    def test_a_download_that_writes_no_file_is_reported_not_hidden(self):
+        # yt-dlp can exit 0 having written nothing, which is what the library
+        # reports as an empty list. Silence there would look like success.
+        def writes_nothing(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            if "--list-subs" in args:
+                return videokit.RunOutput(SUBS_TABLE, "")
+            return videokit.RunOutput("", "")
+
+        videokit._run = writes_nothing
+        code, printed, err = self._run_main(
+            ["audio", "BV1Y5QgB5Eas", "--parts", "1", "--out", str(self.out)]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("没有报告写出文件", printed + err)
+
+    def test_no_part_selection_covers_every_part(self):
+        _, printed, _ = self._run_main(
+            ["audio", "BV1Y5QgB5Eas", "--out", str(self.out)]
+        )
+        self.assertIn("[30/30]", printed)
+        self.assertEqual(
+            len([a for a in self.calls if "--audio-format" in a]), 30
+        )
+
+
+class MissingTiers(unittest.TestCase):
+    """Which quality tiers the platform refused, read off yt-dlp's own words.
+
+    The JSON format table cannot answer this. Measured on the same video with a
+    working credential and with no credential at all, the two tables are
+    identical row for row, 15 rows each, same `format_id`, `quality`, `format`
+    and `tbr`, and the highest `quality` is 80 in both. So a caller that reads
+    only `formats` cannot tell whether the high-bitrate tier is missing, and
+    would report the normal 1080P as if it were the premium one. The sentence
+    yt-dlp prints is the only signal there is.
+    """
+
+    def test_reads_the_tier_yt_dlp_named(self):
+        # Expected value read off the recorded line, not recomputed.
+        self.assertEqual(videokit.missing_tiers(PREMIUM_LINE), ("1080P 高码率",))
+
+    def test_several_tiers_are_all_returned(self):
+        # The logged-out wording names three. Both shapes occur, so the parser
+        # reads the list rather than one fixed tier.
+        text = (
+            "[BiliBili] Format(s) 1080P 高码率, 1080P 高清, 720P 准高清 are "
+            "missing; you have to become a premium member to download them.\n"
+        )
+        self.assertEqual(
+            videokit.missing_tiers(text),
+            ("1080P 高码率", "1080P 高清", "720P 准高清"),
+        )
+
+    def test_nothing_is_reported_when_no_tier_is_missing(self):
+        self.assertEqual(videokit.missing_tiers(""), ())
+        self.assertEqual(
+            videokit.missing_tiers("[BiliBili] Extracting URL: https://x\n"), ()
+        )
+
+
+class PremiumTier(unittest.TestCase):
+    """Whether the tier above the one on offer is out of reach.
+
+    `_format_selector("1080p")` names format 30080, whose `format` field is
+    `1080P 高清`. The membership tier is a different, higher-bitrate stream
+    called `1080P 高码率`, measured at 820.8 kbps on the same part where
+    `1080P 高清` is 416.6. A user who asks for 1080p and gets the normal tier
+    must be told, and the only evidence available is the tier name yt-dlp
+    reported missing.
+    """
+
+    def test_the_premium_tier_is_reported_as_unavailable(self):
+        self.assertTrue(videokit.premium_unavailable(("1080P 高码率",)))
+
+    def test_a_missing_normal_tier_is_not_a_premium_problem(self):
+        # 720P 准高清 is not the membership tier, so its absence says nothing
+        # about whether the high-bitrate one was withheld.
+        self.assertFalse(videokit.premium_unavailable(("720P 准高清",)))
+
+    def test_nothing_missing_means_nothing_to_warn_about(self):
+        self.assertFalse(videokit.premium_unavailable(()))
+
+    def test_a_missing_tier_that_is_not_the_premium_one_is_not_reported(self):
+        # "1080P 高清" is the normal tier the selector already names. Calling it
+        # premium would tell the user they lost a tier they never asked for.
+        self.assertFalse(videokit.premium_unavailable(("1080P 高清",)))
+
+
+class ProbeMissingTiers(unittest.TestCase):
+    """`probe` must hand the withheld-tier evidence to its caller.
+
+    The evidence is not in the JSON, so `probe` reads it off the text of the
+    calls it already makes. Both streams are scanned because the sentence's
+    location is not fixed: measured today it arrives on stdout, and the
+    recorded `list-subs-login-warning.txt` shows the sibling warning arriving
+    on stderr. Keying on one stream alone would drop the warning on whichever
+    run puts it elsewhere.
+    """
+
+    # `list-subs-multipart.txt` carries its own copy of the sentence, but with
+    # the tier name stored as six U+FFFD replacement characters. That mangled
+    # name is not the premium marker, so the recorded table cannot be used as
+    # the measured signal. The lines are dropped here and the live-recorded
+    # `PREMIUM_LINE` is used instead, which is what a run on this machine
+    # produces today.
+    PLAIN_SUBS = "\n".join(
+        line for line in MULTI_SUBS.splitlines() if "Format(s)" not in line
+    )
+
+    def setUp(self):
+        self.original = videokit._run
+
+    def tearDown(self):
+        videokit._run = self.original
+
+    def _stub(self, premium_stream: str):
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            if premium_stream == "stdout":
+                return videokit.RunOutput(
+                    self.PLAIN_SUBS + PREMIUM_LINE, ""
+                )
+            return videokit.RunOutput(self.PLAIN_SUBS, PREMIUM_LINE)
+
+        videokit._run = fake_run
+
+    def test_probe_reports_the_withheld_tier_from_stdout(self):
+        self._stub("stdout")
+        video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+        self.assertEqual(video.missing_tiers, ("1080P 高码率",))
+        self.assertTrue(videokit.premium_unavailable(video.missing_tiers))
+
+    def test_probe_finds_the_line_on_stderr_too(self):
+        self._stub("stderr")
+        video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+        self.assertEqual(video.missing_tiers, ("1080P 高码率",))
+
+    def test_a_run_that_withholds_nothing_reports_no_tier(self):
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(self.PLAIN_SUBS, "")
+
+        videokit._run = fake_run
+        video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+        self.assertEqual(video.missing_tiers, ())
+        self.assertFalse(videokit.premium_unavailable(video.missing_tiers))
+
+    def test_a_mangled_tier_name_does_not_raise_the_premium_warning(self):
+        # A known limit, recorded rather than left to be discovered. The tier
+        # name comes from yt-dlp and has to survive this module's decoding of
+        # the subprocess; when it does not, the name is replacement characters
+        # and the premium marker is not in it, so the warning is missed. The
+        # recorded fixture is exactly this case. Fixing it belongs with the
+        # decoding defect recorded in the README, not here.
+        tiers = videokit.missing_tiers(MULTI_SUBS)
+        self.assertEqual(len(tiers), 1)
+        self.assertFalse(videokit.premium_unavailable(tiers))
+
+
+class CommandLine(unittest.TestCase):
+    """One entry point from which all four capabilities are reachable.
+
+    The ticket's first criterion. A caller who has not read the source must be
+    able to discover what exists, so the help text is asserted rather than
+    assumed, and an unknown subcommand must be refused rather than silently
+    doing the wrong thing.
+    """
+
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = videokit.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_all_four_capabilities_are_reachable_and_named(self):
+        code, out, err = self._run_main(["--help"])
+        self.assertEqual(code, 0)
+        printed = out + err
+        for name in ("probe", "video", "audio", "transcript"):
+            with self.subTest(name=name):
+                self.assertIn(name, printed)
+
+    def test_help_says_what_each_subcommand_does(self):
+        # A name alone does not tell a reader which of "download video" and
+        # "download audio" they want.
+        _, out, err = self._run_main(["--help"])
+        printed = out + err
+        self.assertIn("probe", printed)
+        self.assertIn("下载", printed)
+
+    def test_no_arguments_prints_usage_and_exits_nonzero(self):
+        code, out, err = self._run_main([])
+        self.assertNotEqual(code, 0)
+        self.assertIn("probe", out + err)
+
+    def test_an_unknown_subcommand_is_refused_with_usage(self):
+        code, out, err = self._run_main(["frobnicate"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("probe", out + err)
+
+    def test_each_subcommand_has_its_own_help(self):
+        for name in ("probe", "video", "audio", "transcript"):
+            with self.subTest(name=name):
+                code, out, err = self._run_main([name, "--help"])
+                self.assertEqual(code, 0)
+                printed = out + err
+                self.assertIn(name, printed)
+                self.assertIn("usage", printed.lower())
+
+    def test_the_help_names_the_other_subcommands(self):
+        # A reader who lands on one subcommand's help should see the rest, so
+        # they do not have to guess that the other three exist.
+        _, out, err = self._run_main(["probe", "--help"])
+        printed = out + err
+        for name in ("probe", "video", "audio", "transcript"):
+            with self.subTest(name=name):
+                self.assertIn(name, printed)
+
+
+class ProbeOutput(unittest.TestCase):
+    """`videokit probe` printed so a person can read it.
+
+    Every expected value below is read off `dump-multipart.json` and
+    `list-subs-multipart.txt`, which are real recorded yt-dlp output, so they
+    are independent of how the report is built. The measurements: 30 parts,
+    3437.528 seconds for part 1, 5761.010 for part 30, 21 parts with an
+    `ai-zh` track and 9 without, them being 1, 2, 6, 7, 8, 9, 13, 23 and 28.
+    """
+
+    # The live-recorded sentence replaces the fixture's copy, whose tier name
+    # is stored as six U+FFFD and so cannot carry the real Chinese name.
+    PLAIN_SUBS = "\n".join(
+        line for line in MULTI_SUBS.splitlines() if "Format(s)" not in line
+    )
+
+    def setUp(self):
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(self.PLAIN_SUBS + PREMIUM_LINE, "")
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+
+    def _probe(self, *extra: str) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = videokit.main(["probe", "BV1Y5QgB5Eas", *extra])
+        self.assertEqual(code, 0)
+        return out.getvalue()
+
+    def _part_lines(self, printed: str) -> list[str]:
+        """The printed lines that describe one part, in order.
+
+        Anchored on the leading indent and a duration, which is the shape of a
+        part row. The summary line begins at the margin and carries no
+        duration column, so it cannot be mistaken for one.
+        """
+        return [line for line in printed.splitlines()
+                if re.match(r"^\s{2,}(\d+)\s+\d+(?:分|小时)", line)]
+
+    def test_the_part_count_is_reported(self):
+        printed = self._probe()
+        self.assertIn("30", printed)
+        self.assertEqual(len(self._part_lines(printed)), 30)
+
+    def test_each_part_carries_its_measured_duration(self):
+        printed = self._probe()
+        lines = self._part_lines(printed)
+        # 3437.528 s and 5761.010 s, as a reader would say them.
+        self.assertIn("57分18秒", lines[0])
+        self.assertIn("1小时36分1秒", lines[-1])
+
+    def test_the_total_running_time_is_reported(self):
+        printed = self._probe()
+        # 132076.843 seconds over the 30 parts.
+        self.assertIn("36", printed)
+        self.assertIn("小时", printed)
+
+    def test_each_part_carries_its_subtitle_status(self):
+        printed = self._probe()
+        lines = self._part_lines(printed)
+        self.assertEqual(sum("ai-zh" in line for line in lines), 21)
+        self.assertEqual(sum("无字幕" in line for line in lines), 9)
+
+    def test_the_parts_without_subtitles_are_the_measured_ones(self):
+        printed = self._probe()
+        lines = self._part_lines(printed)
+        without = [
+            int(re.match(r"^\s*(\d+)", line).group(1))
+            for line in lines
+            if "无字幕" in line
+        ]
+        self.assertEqual(tuple(without), PARTS_WITHOUT_SUBTITLES)
+
+    def test_the_quality_tiers_are_listed_with_their_measured_numbers(self):
+        printed = self._probe()
+        # Names, ids, bitrates and sizes all read off the fixture.
+        self.assertIn("720P 准高清", printed)
+        self.assertIn("720p", printed)
+        self.assertIn("1080P 高清", printed)
+        self.assertIn("213.9", printed)   # 720p hevc tbr, 213.874 kbps
+        self.assertIn("820.8", printed)   # 1080p avc1 tbr, 820.842 kbps
+        self.assertIn("336.4", printed)   # 1080p avc1, 352708419 bytes as MiB
+
+    def test_all_four_selectable_qualities_appear(self):
+        printed = self._probe()
+        for name in ("360p", "480p", "720p", "1080p"):
+            with self.subTest(name=name):
+                self.assertIn(name, printed)
+
+    def test_the_premium_tier_is_named_as_unavailable(self):
+        printed = self._probe()
+        self.assertIn("1080P 高码率", printed)
+        self.assertIn("未拿到", printed)
+
+    def test_the_premium_note_says_which_tier_was_actually_reached(self):
+        # The ticket's point: a user who asked for 1080p and received the
+        # normal tier must not believe they got the high-bitrate one.
+        printed = self._probe()
+        self.assertIn("普通档", printed)
+        self.assertIn("1080P 高清", printed)
+
+
+class TranscriptProgress(unittest.TestCase):
+    """`videokit transcript` shows progress, and its summary covers every status.
+
+    A full run of the first real target is about 48 minutes, of which speech
+    recognition is about 39. Silence for that long reads as a hang, so a part
+    that goes to the engine is named when it starts and timed when it ends.
+
+    The summary is asserted for the statuses present rather than for a fixed
+    list. Tickets #18 and #19 add `failed` and `skipped` records to this same
+    data structure, so a tally that named only today's values would silently
+    drop theirs.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original = videokit._run
+        self.original_engine = videokit.load_engine
+        self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
+        self.loads: list[str] = []
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            if "--list-subs" in args:
+                return videokit.RunOutput(SUBS_TABLE, "")
+            part = int(args[args.index("--playlist-items") + 1])
+            if "--audio-format" in args:
+                return videokit.RunOutput(str(self.audio / f"{part:02d}.wav"), "")
+            if part in PARTS_WITH_SUBTITLES:
+                return videokit.RunOutput(SUB_PRINT_PART, "")
+            return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
+
+        videokit._run = fake_run
+        videokit.load_engine = lambda device="cpu": self.loads.append(device) or self.engine
+        self.addCleanup(setattr, videokit, "_run", self.original)
+        self.addCleanup(setattr, videokit, "load_engine", self.original_engine)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        self.out = self.tmp / "transcripts"
+        self.audio = self.tmp / "audio"
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _run_main(self, *extra: str):
+        # Both streams into one buffer, in write order. Progress goes to stderr
+        # and the report to stdout, so asserting on stdout alone would miss the
+        # progress and asserting on them separately would lose their order.
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = videokit.main(
+                ["transcript", "BV1Y5QgB5Eas", "--out", str(self.out),
+                 "--audio-out", str(self.audio), *extra]
+            )
+        return code, out.getvalue() + err.getvalue(), err.getvalue()
+
+    def test_the_plan_is_printed_before_the_waiting_starts(self):
+        # The estimate has to come before the run, not after, or the reader has
+        # already spent the time not knowing.
+        _, printed, _ = self._run_main("--parts", "1,3")
+        self.assertIn("语音识别", printed)
+
+    def test_each_part_sent_to_the_engine_is_named(self):
+        _, printed, _ = self._run_main("--parts", "1,6")
+        for index in (1, 6):
+            with self.subTest(index=index):
+                self.assertRegex(printed, rf"第\s*{index}\s*讲")
+
+    def test_a_part_that_needs_no_engine_is_not_announced_as_transcribing(self):
+        # Part 3 has a platform track, so it must not be reported as going
+        # through speech recognition. A line there would misstate the work.
+        _, printed, _ = self._run_main("--parts", "3")
+        self.assertNotIn("语音识别开始", printed)
+        self.assertEqual(self.loads, [])
+
+    def test_progress_appears_before_the_end_summary(self):
+        # Order is the point. A line printed only at the end is not progress,
+        # and one buffer in write order is what tells the two apart.
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            videokit.main(
+                ["transcript", "BV1Y5QgB5Eas", "--out", str(self.out),
+                 "--audio-out", str(self.audio), "--parts", "1"]
+            )
+        text = printed.getvalue()
+        self.assertIn("语音识别开始", text)
+        self.assertIn("delivered", text)
+        self.assertLess(text.index("语音识别开始"), text.index("delivered"))
+
+    def test_the_report_stays_on_stdout_with_progress_on_stderr(self):
+        # So a caller can redirect the delivered report to a file and still see
+        # the running commentary on the terminal.
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            videokit.main(
+                ["transcript", "BV1Y5QgB5Eas", "--out", str(self.out),
+                 "--audio-out", str(self.audio), "--parts", "1"]
+            )
+        self.assertIn("delivered", out.getvalue())
+        self.assertNotIn("语音识别开始", out.getvalue())
+        self.assertIn("语音识别开始", err.getvalue())
+
+    def test_the_end_summary_is_printed(self):
+        _, printed, _ = self._run_main("--parts", "1,3")
+        self.assertIn("delivered", printed)
+        self.assertIn("platform", printed)
+        self.assertIn("ASR", printed)
+
+    def test_the_summary_carries_a_status_tally(self):
+        _, printed, _ = self._run_main("--parts", "1,3")
+        self.assertIn("状态", printed)
+        self.assertIn("ok", printed)
+
+
+class StatusTally(unittest.TestCase):
+    """The summary counts whatever statuses the records actually carry.
+
+    Tickets #18 and #19 extend this data structure with `failed` and
+    `skipped`. The tally is written against the values found on the records,
+    sorted, so their records appear without this file naming them.
+    """
+
+    def _record(self, index: int, status: str):
+        return videokit.PartTranscript(
+            bvid="BV1Y5QgB5Eas", index=index, title=f"{index:02d}-t",
+            duration_sec=1.0, source=None, language=None, segments=(),
+            status=status,
+        )
+
+    def test_every_status_present_is_counted(self):
+        tally = videokit.status_tally([
+            self._record(1, "ok"),
+            self._record(2, "ok"),
+            self._record(3, "failed"),
+        ])
+        self.assertIn("ok", tally)
+        self.assertIn("2", tally)
+        self.assertIn("failed", tally)
+
+    def test_a_status_this_module_does_not_know_is_still_counted(self):
+        # Nothing here names `skipped`; the point is that a value added by
+        # another ticket shows up without an edit in this file.
+        tally = videokit.status_tally([
+            self._record(1, "ok"),
+            self._record(2, "skipped"),
+        ])
+        self.assertIn("skipped", tally)
+        self.assertIn("1", tally)
+
+    def test_an_empty_batch_tallies_nothing_rather_than_raising(self):
+        self.assertEqual(videokit.status_tally([]), "")
+
+
+class ConsoleEncoding(unittest.TestCase):
+    """The CLI's own output survives a console that cannot render it.
+
+    The console on this machine is cp936 and `sys.stdout.encoding` is gbk, so
+    writing to it goes through `encodings.gbk` in strict mode. Measured, that
+    raises UnicodeEncodeError for characters outside the code page: U+20000,
+    an emoji, U+2022 and U+FFFD all fail, while ordinary Chinese and the
+    box-drawing characters used by the report do not.
+
+    A part title comes from the platform, so the CLI cannot assume it encodes.
+    The measured titles of the first real target all do, which is one video and
+    not a guarantee. Crashing on an unprintable title would hand the user a
+    traceback instead of the report they asked for, which is the failure the
+    ticket's wording exists to avoid.
+    """
+
+    class _Cp936Pipe(io.StringIO):
+        """A stdout that behaves like the measured cp936 pipe.
+
+        `io.StringIO` accepts every character, so a report could be built and
+        printed here without ever touching the code page that fails in
+        practice. This encoding step is what the real stream does.
+        """
+
+        encoding = "gbk"
+
+        def write(self, text):
+            text.encode("cp936")  # strict, as the real stream is
+            return super().write(text)
+
+    def setUp(self):
+        self.original = videokit._run
+
+        def fake_run(args, cookies):
+            if "--dump-single-json" in args:
+                return videokit.RunOutput(MULTI_DUMP, "")
+            return videokit.RunOutput(SUBS_TABLE + PREMIUM_LINE, "")
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", self.original)
+
+    def test_a_title_the_console_cannot_render_does_not_crash_probe(self):
+        # U+20000 and an emoji, both measured to fail on cp936.
+        video = videokit.Video(
+            id="BV1Y5QgB5Eas",
+            title="测试\U00020000标题",
+            parts=(
+                videokit.Part(
+                    1, "BV1Y5QgB5Eas_p1", "01-\U0001f3ac讲", 3437.528, ("ai-zh",)
+                ),
+            ),
+            formats=(),
+        )
+        stream = self._Cp936Pipe()
+        original_probe = videokit.probe
+        videokit.probe = lambda url, cookies=None: video
+        self.addCleanup(setattr, videokit, "probe", original_probe)
+
+        code = 0
+        try:
+            with contextlib.redirect_stdout(stream):
+                code = videokit.main(["probe", "BV1Y5QgB5Eas"])
+        except UnicodeEncodeError as exc:
+            self.fail(f"probe crashed on an unprintable title: {exc}")
+        self.assertEqual(code, 0)
+        printed = stream.getvalue()
+        self.assertTrue(printed.strip())
+
+    def test_the_unprintable_character_is_replaced_not_dropped_silently(self):
+        # The rest of the report has to survive. A title that renders as
+        # question marks is honest about the console's limit; a title whose
+        # remaining characters vanished would look like a different video.
+        video = videokit.Video(
+            id="BV1Y5QgB5Eas",
+            title="测试\U00020000标题",
+            parts=(),
+            formats=(),
+        )
+        stream = self._Cp936Pipe()
+        original_probe = videokit.probe
+        videokit.probe = lambda url, cookies=None: video
+        self.addCleanup(setattr, videokit, "probe", original_probe)
+
+        with contextlib.redirect_stdout(stream):
+            videokit.main(["probe", "BV1Y5QgB5Eas"])
+        printed = stream.getvalue()
+        self.assertIn("测试", printed)
+        self.assertIn("标题", printed)
+        self.assertIn("BV1Y5QgB5Eas", printed)
+
+    def test_the_help_text_survives_the_measured_console(self):
+        stream = self._Cp936Pipe()
+        with contextlib.redirect_stdout(stream):
+            code = videokit.main(["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("probe", stream.getvalue())
+
+    def test_the_failure_path_also_survives(self):
+        # A reference the platform rejects carries a message the user must
+        # read, so the error path needs the same treatment as the report.
+        def failing(args, cookies):
+            raise videokit.VideoKitError("失败\U00020000原因")
+
+        videokit._run = failing
+        stream = self._Cp936Pipe()
+        err = self._Cp936Pipe()
+        code = 0
+        try:
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(err):
+                code = videokit.main(["probe", "BV1Y5QgB5Eas"])
+        except UnicodeEncodeError as exc:
+            self.fail(f"the error path crashed on an unprintable message: {exc}")
+        self.assertNotEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

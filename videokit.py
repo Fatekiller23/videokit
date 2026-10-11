@@ -116,6 +116,11 @@ class Video:
     title: str
     parts: tuple[Part, ...]
     formats: tuple[dict, ...] = field(default_factory=tuple)
+    # The tiers yt-dlp reported as withheld. Carried on the probe result rather
+    # than fetched again by the caller, because the JSON format table cannot
+    # answer this and the sentence is only in the text of a call `probe`
+    # already makes. See `missing_tiers`.
+    missing_tiers: tuple[str, ...] = field(default_factory=tuple)
 
 
 def login_needed(subs: dict[str, tuple[str, ...]], stderr: str) -> bool:
@@ -809,6 +814,10 @@ def probe(url: str, cookies: Path | None = None) -> Video:
         title=data.get("title", ""),
         parts=tuple(sorted(parts, key=lambda p: p.index)),
         formats=tuple(entries[0].get("formats") or ()),
+        # Both streams, because the sentence's stream is not fixed. Measured
+        # today it arrives on stdout with a working credential; the recorded
+        # login warning shows the sibling signal arriving on stderr.
+        missing_tiers=missing_tiers(subs_run.stdout, subs_run.stderr),
     )
 
 
@@ -1255,23 +1264,96 @@ def transcripts(
     return tuple(records)
 
 
+# The sentence yt-dlp prints when the platform withheld a tier it knows about.
+# Measured on the first real target, it reads
+#
+#   [BiliBili] Format(s) 1080P 高码率 are missing; you have to become a premium
+#   member to download them.
+#
+# The format table cannot substitute for this. Measured on the same video with
+# a working credential and with none, the two `formats` tables are identical
+# row for row, 15 rows each with the same `format_id`, `quality`, `format` and
+# `tbr`, and the highest `quality` is 80 in both. So nothing in the JSON says
+# whether the high-bitrate tier was withheld, and a caller reading only
+# `formats` reports the normal 1080P as if it were the premium one.
+_MISSING_TIERS = re.compile(r"Format\(s\) (.+?) are missing")
+
+# What marks a tier as the membership one. `1080P 高码率` is the measured name,
+# and the marker is the distinguishing word rather than the whole name: the
+# normal tier on the same page is `1080P 高清`, which differs only in that word.
+# Keying on the full name would silently stop matching if the platform reworded
+# the rest, and a missed warning is the failure this exists to prevent. It does
+# not match `1080P 高清` or `720P 准高清`, so the two do not collide.
+_PREMIUM_MARKER = "高码率"
+
+
+def missing_tiers(text: str, *more: str) -> tuple[str, ...]:
+    """The tiers yt-dlp reported as withheld, in the order it named them.
+
+    Accepts any number of text blocks so a caller can pass every stream it
+    captured without deciding which one holds the sentence. The measured
+    location is stdout and it repeats once per part, so the result is
+    deduplicated; a 30-part course prints the same sentence 30 times.
+
+    An empty result means either that nothing was withheld or that yt-dlp said
+    nothing, and the two are not distinguished here. Reporting "no tier is
+    missing" is the honest reading of silence.
+    """
+    found: list[str] = []
+    for block in (text, *more):
+        for line in block.splitlines():
+            match = _MISSING_TIERS.search(line)
+            if not match:
+                continue
+            for tier in match.group(1).split(","):
+                tier = tier.strip()
+                if tier and tier not in found:
+                    found.append(tier)
+    return tuple(found)
+
+
+def premium_unavailable(tiers: Iterable[str]) -> bool:
+    """Whether the withheld tiers include the membership high-bitrate one.
+
+    Kept apart from `missing_tiers` because the two answer different questions
+    and only this one changes what the user is told. A caller that asks for
+    1080p receives the normal tier and would otherwise believe it got the
+    better one, which is the confusion this exists to remove.
+    """
+    return any(_PREMIUM_MARKER in tier for tier in tiers)
+
+
+# The qualities `_format_selector` accepts, with the format id it names for
+# each. One table serves the report, the validation and the selector, so the
+# names a caller is offered are exactly the names that work.
+_QUALITIES: dict[str, str] = {
+    "360p": "30011",   # hevc, ~35 MB/part
+    "480p": "30033",   # hevc,  ~52 MB/part
+    "720p": "30066",   # hevc, ~131 MB/part
+    "1080p": "30080",  # avc1, ~336 MB/part
+}
+
+# What a download gets when the caller names no quality. 720p is the measured
+# middle: 87.6 MiB per part against 336.4 for 1080p, and the video is lecture
+# material where the text on screen is what matters.
+_DEFAULT_QUALITY = "720p"
+
+
 def _format_selector(quality: str) -> str:
     """Map a quality name to a yt-dlp format expression.
 
     Bilibili serves video and audio as separate streams and does not offer a
     muxed one, so both selectors name a video stream plus an audio stream.
     """
-    video = {
-        "1080p": "30080",   # avc1, ~336 MB/part
-        "720p": "30066",    # hevc, ~131 MB/part
-        "480p": "30033",    # hevc,  ~52 MB/part
-        "360p": "30011",    # hevc,  ~35 MB/part
-    }
-    if quality not in video:
+    if quality not in _QUALITIES:
         raise ValueError(
-            f"unknown quality {quality!r}; expected one of {sorted(video)}"
+            f"unknown quality {quality!r}; expected one of {sorted(_QUALITIES)}"
         )
-    return f"{video[quality]}+30280"  # 30280 = highest-bitrate audio
+    return f"{_QUALITIES[quality]}+{_AUDIO_FORMAT_ID}"  # 30280 = highest-bitrate audio
+
+
+# The highest-bitrate audio stream, which is what every selector pairs with.
+_AUDIO_FORMAT_ID = "30280"
 
 
 def _download(
@@ -1659,30 +1741,187 @@ def transcribe(
     return asr_segments(result.get("text", ""), result.get("timestamp") or [])
 
 
-def main(argv: list[str] | None = None) -> int:
-    """The credential command. Returns a process exit code.
+# --- The command line entry point (ticket #20) ----------------------------
+#
+# One entry point exposes all four capabilities so a caller does not have to
+# import the module to use them. The help text is part of the deliverable: the
+# ticket asks that the argument names and the help be usable by someone who has
+# not read the source, so what each subcommand does is stated rather than
+# implied by its name. "video" and "audio" differ only in what comes back, and
+# a reader who cannot tell them apart picks the wrong one and downloads an hour
+# of video to transcribe.
 
-    Scope is deliberately two subcommands. `login` exists because the scan has
-    to be reachable without importing the module. `transcript` exists because
-    the ticket asks for one command that turns a BV number into delivered
-    transcripts. The general CLI that exposes probe and both downloads belongs
-    to ticket #20.
+_USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
+
+子命令
+  probe       探测。报告有多少讲、每讲多长、哪些有字幕、有哪些清晰度档位。
+              只是问，不下载任何文件数据。
+  video       下载视频。按清晰度下选定讲次，分开的音视频流自动合并成一个文件。
+  audio       只下音频。直接落成 16 kHz 单声道 WAV，就是语音识别要的格式，
+              同一讲的文件从上百 MB 降到几十 MB。
+  transcript  转文稿。有字幕的讲次取平台字幕，无字幕的取音频跑本地语音识别，
+              两者都写成交付文稿，一条命令跑完。
+  login       登录一次。拉起浏览器扫码，凭据落盘，之后不必再登。
+
+选项
+  --parts 3,4        只处理这几讲。省略表示全部讲次。
+  --out 目录         产物写到这里。
+  --audio-out 目录   transcript 用的音频落点。
+  --quality 720p     视频清晰度，仅 video 用。可选 360p / 480p / 720p / 1080p。
+  -h, --help         显示帮助。
+
+例子
+  videokit probe BV1Y5QgB5Eas
+  videokit video BV1Y5QgB5Eas --quality 720p --parts 3,4 --out videos
+  videokit audio BV1Y5QgB5Eas --out audio
+  videokit transcript BV1Y5QgB5Eas --out transcripts
+"""
+
+# One entry per subcommand: the usage line a reader can copy, then what the
+# command does in one sentence. Kept as data so the per-command help and the
+# list in `_USAGE` cannot drift apart, and so a new subcommand cannot be added
+# without appearing in the help.
+_SUBCOMMANDS: dict[str, tuple[str, str]] = {
+    "probe": (
+        "videokit probe <BV号或链接> [--parts 3,4]",
+        "探测。报告有多少讲、每讲多长、哪些有字幕、有哪些清晰度档位，"
+        "并说明会员高码率档是否拿到。不下载任何文件数据。",
+    ),
+    "video": (
+        "videokit video <BV号或链接> [--quality 720p] [--parts 3,4] [--out 目录]",
+        "下载视频。分开的音视频流自动合并成一个文件。清晰度可选 "
+        "360p / 480p / 720p / 1080p，默认 720p。",
+    ),
+    "audio": (
+        "videokit audio <BV号或链接> [--parts 3,4] [--out 目录]",
+        "只下音频，落成 16 kHz 单声道 WAV，语音识别直接用这个文件。",
+    ),
+    "transcript": (
+        "videokit transcript <BV号或链接> [--parts 3,4] [--out 目录] "
+        "[--audio-out 目录]",
+        "逐讲判定并产出文稿。有字幕的取平台字幕，无字幕的取音频跑本地语音识别，"
+        "两者都写成交付文稿，不需要另跑一条命令。",
+    ),
+    "login": (
+        "videokit login",
+        "登录一次。拉起浏览器窗口，扫码后把凭据落盘，"
+        "探测、下载、转文稿之后自动使用它。",
+    ),
+}
+
+_OPTIONS_HELP = """选项
+  --parts 3,4        只处理这几讲。省略表示全部讲次。
+  --out 目录         产物写到这里。
+  --audio-out 目录   transcript 用的音频落点。
+  --quality 720p     视频清晰度，仅 video 用。可选 360p / 480p / 720p / 1080p。
+  -h, --help         显示帮助。
+"""
+
+# What a caller may type to ask for help, and what the module answers to.
+_HELP_FLAGS = ("-h", "--help")
+
+
+def _wants_help(args: list[str]) -> bool:
+    return any(a in _HELP_FLAGS for a in args)
+
+
+def _references(args: list[str]) -> list[str]:
+    """The positional arguments, which is where the BV number or link lives."""
+    options_with_values = {"--parts", "--out", "--quality", "--audio-out"}
+    found: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in options_with_values:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        found.append(arg)
+    return found
+
+
+def _print_help(name: str | None = None) -> int:
+    """Print the general help, or one subcommand's.
+
+    The general form lists every subcommand, and a subcommand's own help names
+    the others as well, so a reader who arrives at one of them can still find
+    the rest without guessing that they exist.
+    """
+    if name is None:
+        print(_USAGE, end="")
+        return 0
+    usage, description = _SUBCOMMANDS[name]
+    print(f"usage: {usage}\n")
+    print(description + "\n")
+    print(_OPTIONS_HELP, end="")
+    print("其他子命令")
+    for other in _SUBCOMMANDS:
+        if other != name:
+            print(f"  {other}")
+    return 0
+
+
+def _usage_error(text: str) -> int:
+    """Refuse a command line, naming what was wrong, and exit nonzero.
+
+    The general usage is printed beside the complaint, so the reader does not
+    have to run a second command to learn the syntax.
+    """
+    print(text, file=sys.stderr)
+    print(file=sys.stderr)
+    print(_USAGE, end="", file=sys.stderr)
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The command line entry point. Returns a process exit code.
+
+    Five subcommands, dispatched by name. `--help` is answered before any
+    argument is validated, so it works with no video reference, which is how a
+    reader discovers the syntax in the first place.
+
+    Both output streams are wrapped for the run so an unprintable character
+    cannot turn a report into a traceback. See `_ConsoleSafe`. The real streams
+    are restored on the way out, including on an exception, so importing this
+    module does not leave them altered for the caller.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["transcript"]:
-        return _transcript_command(argv[1:])
-    if argv[:1] != ["login"]:
-        print(
-            "usage: videokit login\n"
-            "       videokit transcript <BV号或链接> [--out 目录] [--parts 3,4]\n\n"
-            "Log in to Bilibili once. Opens a browser window, and after the QR "
-            "code is scanned it stores a credential file that probe and the "
-            "downloads then use automatically.\n\n"
-            "transcript judges every part of a video and writes one plain-text "
-            "transcript per part that has subtitles.",
-            file=sys.stderr,
-        )
-        return 2
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _safe_console(real_out), _safe_console(real_err)
+    try:
+        return _dispatch(argv)
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+
+
+def _dispatch(argv: list[str]) -> int:
+    """Route one parsed command line to its subcommand."""
+    if not argv:
+        return _usage_error("missing subcommand")
+
+    name, rest = argv[0], argv[1:]
+    if name in _HELP_FLAGS or name == "help":
+        return _print_help()
+    if name not in _SUBCOMMANDS:
+        return _usage_error(f"unknown subcommand: {name}")
+    if _wants_help(rest):
+        return _print_help(name)
+    if name == "probe":
+        return _probe_command(rest)
+    if name == "video":
+        return _video_command(rest)
+    if name == "audio":
+        return _audio_command(rest)
+    if name == "transcript":
+        return _transcript_command(rest)
+    return _login_command(rest)
+
+
+def _login_command(rest: list[str]) -> int:
+    """`videokit login`. Opens the browser and stores the credential."""
     try:
         path = login()
     except LoginError as exc:
@@ -1692,34 +1931,494 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _duration_text(seconds: float) -> str:
+    """A duration as a person would say it, with the seconds field kept.
+
+    Seconds are the smallest unit the probe data carries, so nothing finer is
+    invented. A part is minutes long and a course is hours long, so hours
+    appear only when there are any; a reader comparing part lengths is not
+    helped by a leading `0小时`.
+    """
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{secs}秒"
+    return f"{minutes}分{secs}秒"
+
+
+def _mebibytes(bytes_: float) -> str:
+    """A size as MiB, one decimal, which is the unit the download sizes read in."""
+    return f"{bytes_ / 1048576:.1f} MiB"
+
+
+def _quality_report(video: Video) -> list[str]:
+    """The quality tiers on offer, with the numbers a choice needs.
+
+    The numbers come from the recorded format table rather than from a
+    constant, so a tier the platform stops offering shows as absent here
+    instead of as a stale line. A row whose `filesize_approx` is missing is
+    reported without a size rather than with a guess.
+
+    Driven by `_QUALITIES`, so the tiers listed are exactly the ones a caller
+    can pass to `--quality`. The platform's own format table lists each tier
+    three times, once per codec, and choosing a quality is not choosing a codec.
+    """
+    by_id = {f.get("format_id"): f for f in video.formats}
+    lines = ["清晰度档位"]
+    for name, format_id in _QUALITIES.items():
+        row = by_id.get(format_id)
+        if row is None:
+            lines.append(f"  {name:6} 本站未提供（格式 {format_id} 不存在）")
+            continue
+        platform_name = row.get("format") or format_id
+        pieces = [f"  {name:6} {platform_name}"]
+        tbr = row.get("tbr")
+        if tbr:
+            pieces.append(f"{tbr:.1f} kbps")
+        size = row.get("filesize_approx") or row.get("filesize")
+        if size:
+            pieces.append(_mebibytes(size))
+        lines.append("  ".join(pieces))
+    return lines
+
+
+def probe_report(video: Video) -> str:
+    """The probe result as text a person reads.
+
+    Four things the caller asked for: how many parts, how long each one is,
+    which qualities exist, and which parts have subtitles. The last is the one
+    that decides how much computing the rest of the work costs, because a part
+    with a track needs no speech recognition at all.
+
+    The withheld-tier note is the part that has to be unmissable. A user who
+    asks for 1080p and is handed the normal tier would otherwise believe they
+    got the high-bitrate stream, and nothing in the format table says
+    otherwise: measured on this video, the table is identical logged in and
+    logged out.
+    """
+    parts = video.parts
+    with_subs = [p for p in parts if p.has_subtitles]
+    without = [p for p in parts if not p.has_subtitles]
+    total = sum(p.duration_sec for p in parts)
+
+    lines: list[str] = [
+        f"{video.title}  ({video.id})",
+        f"{len(parts)} 讲，合计 {_duration_text(total)}",
+        "",
+        "讲次",
+    ]
+    for part in parts:
+        duration = _duration_text(part.duration_sec)
+        if part.has_subtitles:
+            status = "字幕 " + ", ".join(part.subtitle_langs)
+        else:
+            status = "无字幕，需语音识别"
+        lines.append(f"  {part.index:2}  {duration:>12}  {status}")
+
+    lines.append("")
+    lines.append(
+        f"字幕小计  {len(with_subs)} 讲有字幕，{len(without)} 讲无字幕"
+        + (
+            f"（{', '.join(str(p.index) for p in without)}）"
+            if without
+            else ""
+        )
+    )
+    lines.append("")
+    lines.extend(_quality_report(video))
+    lines.append("")
+    lines.extend(_premium_note(video))
+    return "\n".join(lines)
+
+
+def _premium_note(video: Video) -> list[str]:
+    """What to say about the membership high-bitrate tier.
+
+    Three outcomes, each said plainly. When the tier is withheld the note names
+    the normal tier the user will actually receive, because "高码率 unavailable"
+    alone leaves them unsure what they are getting instead. When the tier is
+    not reported missing, nothing is promised either: the sentence yt-dlp
+    prints is the only evidence there is, and its absence is not proof the tier
+    is available.
+    """
+    if premium_unavailable(video.missing_tiers):
+        withheld = ", ".join(video.missing_tiers)
+        return [
+            f"会员档位  未拿到 {withheld}。",
+            "          会员高码率档需要大会员，当前凭据下只能取到普通档",
+            "          1080P 高清。选了 1080p 拿到的是普通档，不是高码率。",
+        ]
+    if video.missing_tiers:
+        withheld = ", ".join(video.missing_tiers)
+        return [f"档位提示  yt-dlp 报告缺档：{withheld}。"]
+    return [
+        "会员档位  未报告缺会员高清档。",
+        "          这一项只能看 yt-dlp 的提示，它没报不等于档位一定拿得到。",
+    ]
+
+
+def _probe_command(rest: list[str]) -> int:
+    """`videokit probe <BV号或链接>`. Reports what is there, downloads nothing."""
+    references = _references(rest)
+    if not references:
+        return _usage_error("probe needs a BV号 or 链接")
+    print("探测中，这一步要跑两次 yt-dlp，约 40 到 90 秒。", flush=True)
+    try:
+        video = probe(video_url(references[0]))
+    except VideoKitError as exc:
+        print(f"probe failed: {exc}", file=sys.stderr)
+        return 1
+    print(probe_report(video))
+    return 0
+
+
+def _selected_parts(video: Video, rest: list[str]) -> list[int]:
+    """Which part indexes to act on, in course order.
+
+    `--parts` is parsed here and validated against the probe result, so a part
+    number that does not exist is refused rather than silently producing
+    nothing. Omitting the option means every part, which is the whole-course
+    case the ticket asks for.
+    """
+    selection = _option(rest, "--parts")
+    if not selection:
+        return [part.index for part in video.parts]
+    wanted: list[int] = []
+    for piece in selection.split(","):
+        piece = piece.strip()
+        if not piece.isdigit():
+            raise ValueError(f"--parts 只收讲次序号，收到 {piece!r}")
+        wanted.append(int(piece))
+    known = {part.index for part in video.parts}
+    unknown = [p for p in wanted if p not in known]
+    if unknown:
+        raise ValueError(
+            f"这个视频没有第 {', '.join(str(p) for p in unknown)} 讲，"
+            f"可选范围是 1 到 {max(known) if known else 0}"
+        )
+    return [p for p in wanted if p in known]
+
+
+def _download_command(kind: str, rest: list[str], quality: str | None) -> int:
+    """Download video or audio, reporting one line per part as it lands.
+
+    Per part rather than one call for the whole selection, and that is a
+    deliberate cost. `_run` captures the subprocess streams, so a single call
+    over 30 parts would show the user nothing at all for the half hour it ran:
+    yt-dlp's own progress output would go into a pipe nobody reads. Calling
+    yt-dlp once per part costs the extra extraction, measured at about 2.6
+    seconds per part on this machine, and buys a real completion line per part.
+
+    No percentage is printed. The only figure the library reports is which
+    files yt-dlp finished writing, so the count of finished parts is the only
+    progress that is measurable, and claiming more would be inventing numbers.
+    """
+    references = _references(rest)
+    if not references:
+        return _usage_error(f"{kind} needs a BV号 or 链接")
+
+    out_dir = Path(_option(rest, "--out") or Path.cwd() / kind)
+    print(f"探测中，先确认要下哪些讲。", flush=True)
+    try:
+        video = probe(video_url(references[0]))
+    except VideoKitError as exc:
+        print(f"{kind} failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        selected = _selected_parts(video, rest)
+    except ValueError as exc:
+        return _usage_error(str(exc))
+    if not selected:
+        print("没有选中任何讲，什么都没做。", file=sys.stderr)
+        return 1
+
+    if quality is not None and quality not in _QUALITIES:
+        # Refused before anything is fetched, and the valid names are listed so
+        # the reader does not have to run a second command to find them.
+        print(
+            f"未知清晰度 {quality!r}，可选 "
+            f"{' / '.join(sorted(_QUALITIES))}。",
+            file=sys.stderr,
+        )
+        return 1
+
+    by_index = {part.index: part for part in video.parts}
+    print(
+        f"共 {len(selected)} 讲，"
+        f"下载到 {out_dir}。每讲下完打印一行。",
+        flush=True,
+    )
+    total_written = 0
+    for position, index in enumerate(selected, start=1):
+        part = by_index[index]
+        label = f"[{position}/{len(selected)}]"
+        print(f"{label} 第 {index} 讲 {_duration_text(part.duration_sec)} 开始", flush=True)
+        try:
+            if kind == "video":
+                written = download_video(
+                    video_url(video.id), out_dir, parts=[index], quality=quality
+                )
+            else:
+                written = download_audio(
+                    video_url(video.id), out_dir, parts=[index]
+                )
+        except VideoKitError as exc:
+            # One part failing does not end the run. The remaining parts are
+            # still worth their file, and the failure is named here rather than
+            # left to a count at the end.
+            print(f"{label} 第 {index} 讲失败：{exc}", file=sys.stderr, flush=True)
+            continue
+        if written:
+            total_written += len(written)
+            for path in written:
+                print(f"{label} 第 {index} 讲完成 {path}", flush=True)
+        else:
+            # yt-dlp exited 0 and reported no file. Saying nothing would read as
+            # success, which is the shape of failure worth naming.
+            print(
+                f"{label} 第 {index} 讲：yt-dlp 没有报告写出文件。",
+                file=sys.stderr,
+                flush=True,
+            )
+    print(f"完成，共写出 {total_written} 个文件到 {out_dir}")
+    return 0
+
+
+def _video_command(rest: list[str]) -> int:
+    """`videokit video <BV号或链接>`. Downloads video, merging both streams."""
+    if _option(rest, "--quality") is None and "--quality" in rest:
+        return _usage_error("--quality 需要一个值")
+    return _download_command(
+        "video", rest, _option(rest, "--quality") or _DEFAULT_QUALITY
+    )
+
+
+def _audio_command(rest: list[str]) -> int:
+    """`videokit audio <BV号或链接>`. Downloads audio as 16 kHz mono WAV."""
+    return _download_command("audio", rest, None)
+
+
+# The audio file name carries this module's own part numbering, so the part
+# being transcribed can be recovered from the file the engine was handed.
+# `audio_path` writes `NN.wav` and `AUDIO_TEMPLATE` is `%(playlist_index)02d`,
+# so the stem is the part index, which is the same fact read backwards.
+_AUDIO_STEM = re.compile(r"^(\d+)$")
+
+
+def _part_of(audio) -> int | None:
+    """The part index a WAV path belongs to, or None when it does not say."""
+    if audio is None:
+        return None
+    match = _AUDIO_STEM.match(Path(str(audio)).stem)
+    return int(match.group(1)) if match else None
+
+
+class _ProgressEngine:
+    """Reports each part as the engine starts and finishes it.
+
+    Progress reaches the user through the engine rather than through a
+    parameter on `transcripts`, and that is deliberate. `transcripts` owns
+    per-part judgment, failure recording and the skip check, so the CLI must
+    call it rather than re-implement its loop. Adding a progress parameter to
+    it would change an interface that tickets #18 and #19 are editing at the
+    same time. Wrapping the engine observes a boundary that already exists, and
+    it is the expensive one: a 47-minute part takes about 3.5 minutes here.
+
+    Which part is being transcribed comes from the WAV path the engine was
+    handed. That is a fact about the call rather than a guess, and it is the
+    only part-identifying information this boundary carries.
+
+    The load stays deferred, so a batch whose every part has a platform track
+    loads nothing and prints nothing.
+    """
+
+    def __init__(self, device: str = "cpu", loader=None, out=None):
+        self._device = device
+        self._loader = loader or load_engine
+        self._engine = None
+        self._out = out if out is not None else sys.stdout
+        self._started: float | None = None
+        self.loads = 0
+
+    def _say(self, text: str) -> None:
+        print(text, file=self._out, flush=True)
+
+    def _resolve(self):
+        if self._engine is None:
+            self._say("首次需要语音识别，正在加载模型，实测约 30 到 70 秒。")
+            began = time.monotonic()
+            self._engine = self._loader(self._device)
+            self.loads += 1
+            self._say(f"模型加载完成，用时 {time.monotonic() - began:.1f} 秒。")
+        return self._engine
+
+    def generate(self, **kwargs):
+        index = _part_of(kwargs.get("input"))
+        if index is not None:
+            self._say(f"第 {index} 讲 语音识别开始")
+            self._started = time.monotonic()
+        try:
+            return self._resolve().generate(**kwargs)
+        finally:
+            if index is not None and self._started is not None:
+                self._say(
+                    f"第 {index} 讲 语音识别完成，用时 "
+                    f"{time.monotonic() - self._started:.1f} 秒"
+                )
+                self._started = None
+
+    @property
+    def model(self):
+        return self._resolve().model
+
+
+def status_tally(records: Iterable[PartTranscript]) -> str:
+    """One line counting the records by status.
+
+    Written against the values found on the records rather than against a fixed
+    list of the ones this ticket knows. Tickets #18 and #19 give this structure
+    the statuses `failed` and `skipped`, so a tally that named only `ok` would
+    report their results as nothing at all. Sorted, so the line is stable.
+    """
+    counts: dict[str, int] = {}
+    for record in records:
+        counts[record.status] = counts.get(record.status, 0) + 1
+    if not counts:
+        return ""
+    return "状态：" + "，".join(
+        f"{status} {counts[status]}" for status in sorted(counts)
+    )
+
+
 def _transcript_command(rest: list[str]) -> int:
     """`videokit transcript <BV号或链接> [--out 目录] [--parts 3,4] [--audio-out 目录]`.
 
     One command for both sources. A part without a subtitle track is
     transcribed from its own audio as part of this run, so the caller does not
     have to notice which parts were missing and invoke something else.
+
+    Progress goes to stderr through `_ProgressEngine`, so a caller that pipes
+    stdout to a file still gets the delivered report there and the running
+    commentary on the terminal. A full run is about 48 minutes, and silence for
+    that long reads as a hang.
     """
-    reference = next((a for a in rest if not a.startswith("-")), None)
-    if reference is None:
-        print(
-            "usage: videokit transcript <BV号或链接> [--out 目录] "
-            "[--parts 3,4] [--audio-out 目录]",
-            file=sys.stderr,
-        )
-        return 2
+    references = _references(rest)
+    if not references:
+        return _usage_error("transcript needs a BV号 or 链接")
+    reference = references[0]
     out_dir = Path(_option(rest, "--out") or Path.cwd() / "transcripts")
     audio_dir = Path(_option(rest, "--audio-out") or default_audio_dir())
     selection = _option(rest, "--parts")
-    parts = [int(p) for p in selection.split(",")] if selection else None
+    if selection is None:
+        parts = None
+    else:
+        try:
+            parts = _parse_parts(selection)
+        except ValueError as exc:
+            return _usage_error(str(exc))
+
+    engine = _ProgressEngine(out=sys.stderr)
+    print(
+        "探测中，先确定哪些讲要跑语音识别。这一步要跑两次 yt-dlp。",
+        file=sys.stderr, flush=True,
+    )
     try:
         records = transcripts(
-            video_url(reference), out_dir, parts, audio_dir=audio_dir
+            video_url(reference), out_dir, parts,
+            audio_dir=audio_dir, engine=engine,
         )
     except VideoKitError as exc:
         print(f"transcript failed: {exc}", file=sys.stderr)
         return 1
-    print(transcript_report(records, out_dir))
+
+    report = transcript_report(records, out_dir)
+    tally = status_tally(records)
+    print(report)
+    if tally:
+        print(tally)
     return 0
+
+
+def _parse_parts(selection: str) -> list[int]:
+    """Parse a `--parts 3,4` value, or explain what is wrong with it."""
+    wanted: list[int] = []
+    for piece in selection.split(","):
+        piece = piece.strip()
+        if not piece.isdigit():
+            raise ValueError(f"--parts 只收讲次序号，收到 {piece!r}")
+        wanted.append(int(piece))
+    return wanted
+
+
+class _ConsoleSafe:
+    """A stdout or stderr wrapper that cannot raise on an unprintable character.
+
+    The console on this machine is cp936 with `errors="strict"`, so writing a
+    character outside that code page raises UnicodeEncodeError. Measured, the
+    failures are U+20000, an emoji, U+2022 and U+FFFD, while ordinary Chinese
+    and the box-drawing characters this report uses are fine.
+
+    Part titles come from the platform, so the CLI cannot assume they encode.
+    A title with one character outside the code page would otherwise turn a
+    finished report into a traceback, which is exactly the "raw low-level error
+    instead of a usable message" outcome the spec's user story 14 rules out.
+
+    Only this module's own output is affected. `sys.stdout` is not reconfigured
+    and the environment is untouched, because `_run`'s decision to let the
+    platform pick the subprocess encoding is deliberate and a test locks it;
+    setting `PYTHONIOENCODING` here would break every Chinese title in a
+    filename, measured and recorded in the README.
+
+    Each write is attempted as the console wants it, and retried with
+    replacement on failure. Substituting at the character level keeps the rest
+    of the text intact, which matters: a title that prints as `测试??标题`
+    still identifies the video, while a write that failed whole would lose the
+    line.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):  # pragma: no cover - streams take text
+            return self._stream.write(text)
+        try:
+            text.encode(getattr(self._stream, "encoding", None) or "utf-8")
+        except (UnicodeEncodeError, LookupError):
+            text = self._replace(text)
+        return self._stream.write(text)
+
+    def _replace(self, text: str) -> str:
+        """`text` with every character the console cannot encode replaced."""
+        encoding = getattr(self._stream, "encoding", None) or "utf-8"
+        try:
+            return text.encode(encoding, "replace").decode(encoding, "replace")
+        except LookupError:  # pragma: no cover - an unknown code page name
+            return text.encode("ascii", "replace").decode("ascii")
+
+    def __getattr__(self, name):
+        # flush, isatty, fileno and the rest belong to the real stream.
+        return getattr(self._stream, name)
+
+
+def _safe_console(stream):
+    """`stream` in a form that cannot raise on an unprintable character.
+
+    A stream with no `encoding`, such as the `io.StringIO` a test substitutes,
+    is returned unchanged: it has no code page to fail against.
+    """
+    if getattr(stream, "encoding", None) is None:
+        return stream
+    if isinstance(stream, _ConsoleSafe):
+        return stream
+    return _ConsoleSafe(stream)
+
+
+# The characters this module's own report is built from. Ordinary Chinese is in
+# cp936; a part title's rarer characters may not be, which is why the wrapper
+# above exists rather than a rule about which characters are allowed.
 
 
 def _option(args: list[str], name: str) -> str | None:
