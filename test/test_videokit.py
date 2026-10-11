@@ -631,6 +631,41 @@ class GitignoreCoverage(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, f"{copied} not ignored")
                 self.assertIn(videokit.PROFILE_DIRNAME, proc.stdout)
 
+    def test_the_cli_default_output_directories_are_ignored(self):
+        # The CLI writes into its working directory when `--out` / `--audio-out`
+        # are omitted, and the documented way to run it is from
+        # `packages/VideoKit`. An audio part is 100 MB and a course is 1.1 GB,
+        # so one reflexive `git add -A` after a real run would stage all of it.
+        # Found by the code review, which is how `packages/VideoKit/audio/`
+        # holding a 105 MB WAV got noticed in the first place.
+        for name in ("audio", "video", "videos", "transcripts"):
+            with self.subTest(dir=name):
+                proc = subprocess.run(
+                    ["git", "check-ignore", "-v", f"packages/VideoKit/{name}/x"],
+                    cwd=self.repo,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, f"{name}/ not ignored")
+                self.assertIn(f"packages/VideoKit/{name}/", proc.stdout)
+
+    def test_the_ignore_rules_do_not_swallow_the_package(self):
+        # The rule must be narrow enough that ordinary source and fixtures stay
+        # committable. An unanchored `audio/` would also hide any future source
+        # directory of that name anywhere in the tree.
+        for kept in (
+            "packages/VideoKit/videokit.py",
+            "packages/VideoKit/test/fixtures/dump-multipart.json",
+        ):
+            with self.subTest(path=kept):
+                proc = subprocess.run(
+                    ["git", "check-ignore", "-v", kept],
+                    cwd=self.repo,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 1, f"{kept} should stay committable")
+
 
 class FakeSocket:
     """A stand-in for the CDP WebSocket that records what was sent."""
@@ -1661,15 +1696,31 @@ class TranscriptCompleteness(unittest.TestCase):
             videokit.transcript_complete(self.artifact, PART30_SECONDS), True
         )
 
-    def test_a_zero_duration_part_is_still_judged_on_its_bytes(self):
+    def test_a_zero_duration_part_is_not_reported_as_complete(self):
         # A part the probe reports as zero seconds long has no duration to
-        # measure against, so the length check alone would accept anything.
-        # The decode check still applies, and that is what keeps a torn file
-        # from passing when the duration is missing.
+        # measure against. `probe` fills a missing platform duration with 0.0,
+        # and a length check against 0.0 accepts any non-empty file.
+        #
+        # An earlier version of this test asserted that the decode check alone
+        # covered the gap. Measured, it does not: cutting a real artifact at 331
+        # evenly spaced points, 222 cuts split a character and raise
+        # UnicodeDecodeError, but 109 land on a character boundary and decode as
+        # clean text. So a torn file can pass a decode-only check, and a
+        # one-byte file did pass it. Unverifiable is treated as incomplete,
+        # because skipping is the outcome that loses content silently.
         self.artifact.write_bytes("政策是很重要的".encode("utf-8"))
-        self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), True)
+        self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), False)
+        self.artifact.write_bytes(b"x")
+        self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), False)
         self.artifact.write_bytes(ASR_TEXT.encode("utf-8")[:25592])
         self.assertEqual(videokit.transcript_complete(self.artifact, 0.0), False)
+
+    def test_a_negative_duration_is_not_reported_as_complete(self):
+        # Not reachable from `probe`, which floors at 0.0, but a caller passing
+        # a negative duration would otherwise get `len(text) >= negative`, which
+        # is true for every file.
+        self.artifact.write_bytes("政策是很重要的".encode("utf-8"))
+        self.assertEqual(videokit.transcript_complete(self.artifact, -1.0), False)
 
 
 class SkipExisting(unittest.TestCase):
@@ -3156,7 +3207,9 @@ class DownloadProgress(unittest.TestCase):
 
     def test_a_download_that_writes_no_file_is_reported_not_hidden(self):
         # yt-dlp can exit 0 having written nothing, which is what the library
-        # reports as an empty list. Silence there would look like success.
+        # reports as an empty list. Silence there would look like success, and
+        # so would exit 0: the part produced no file, which is the same outcome
+        # as a download error and has to be visible to a caller the same way.
         def writes_nothing(args, cookies):
             self.calls.append(args)
             if "--dump-single-json" in args:
@@ -3169,7 +3222,7 @@ class DownloadProgress(unittest.TestCase):
         code, printed, err = self._run_main(
             ["audio", "BV1Y5QgB5Eas", "--parts", "1", "--out", str(self.out)]
         )
-        self.assertEqual(code, 0, err)
+        self.assertNotEqual(code, 0)
         self.assertIn("没有报告写出文件", printed + err)
 
     def test_no_part_selection_covers_every_part(self):
@@ -3376,6 +3429,148 @@ class CommandLine(unittest.TestCase):
         for name in ("probe", "video", "audio", "transcript"):
             with self.subTest(name=name):
                 self.assertIn(name, printed)
+
+
+class RefusedBeforeFetching(unittest.TestCase):
+    """A command line that cannot do the work is refused, not run and reported.
+
+    Found by the code review. Three cases reached the network or the writer
+    before anyone checked that the request made sense, and each ended in a
+    result a caller would read as success.
+    """
+
+    def setUp(self):
+        self.calls: list[list[str]] = []
+        self.original_run = videokit._run
+        self.original_engine = videokit.load_engine
+
+        def fake_run(args, cookies):
+            self.calls.append(args)
+            if "--dump-single-json" in args:
+                return stub_run(MULTI_DUMP)
+            if "--list-subs" in args:
+                return stub_run(MULTI_SUBS)
+            return stub_run(SUB_PRINT_PART)
+
+        videokit._run = fake_run
+        videokit.load_engine = lambda device="cpu": _Engine(
+            {"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS}
+        )
+        self.addCleanup(setattr, videokit, "_run", self.original_run)
+        self.addCleanup(setattr, videokit, "load_engine", self.original_engine)
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-refuse-"))
+        self.addCleanup(self._cleanup)
+        self.buffer = io.StringIO()
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def _run_main(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(self.buffer), contextlib.redirect_stderr(err):
+            code = videokit.main(argv)
+        return code, self.buffer.getvalue(), err.getvalue()
+
+    def test_a_part_number_that_does_not_exist_is_refused(self):
+        # This course has 30 parts. `--parts 99` selects nothing, so the run
+        # reported "delivered 0 of 0 parts" and exited 0, which reads as done.
+        # A number outside the range is a mistake in the request.
+        code, out, err = self._run_main(
+            ["transcript", "BV1Y5QgB5Eas", "--parts", "99", "--out", str(self.tmp / "o")]
+        )
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("delivered 0 of 0", out)
+        self.assertIn("99", out + err)
+
+    def test_a_part_number_out_of_range_is_refused_by_probe_too(self):
+        # Same request, same refusal, whichever subcommand was asked. `video`
+        # already refused this; `transcript` did not.
+        code, out, err = self._run_main(
+            ["probe", "BV1Y5QgB5Eas", "--parts", "99"]
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("99", out + err)
+
+    def test_an_out_path_that_is_a_file_is_refused_not_a_traceback(self):
+        # `--out` pointing at an existing regular file reached `mkdir` and
+        # raised FileExistsError, so the user got a Python traceback. User
+        # story 14 asks for a usable message instead of a raw low-level error.
+        occupied = self.tmp / "not-a-directory.txt"
+        occupied.write_text("x", encoding="utf-8")
+        code, out, err = self._run_main(
+            ["transcript", "BV1Y5QgB5Eas", "--parts", "3", "--out", str(occupied)]
+        )
+        self.assertNotEqual(code, 0)
+        printed = out + err
+        self.assertIn("not-a-directory.txt", printed)
+        self.assertNotIn("Traceback", printed)
+        self.assertNotIn("FileExistsError", printed)
+        self.assertEqual(occupied.read_text(encoding="utf-8"), "x")
+
+    def test_an_out_path_that_is_a_file_is_refused_by_video_too(self):
+        occupied = self.tmp / "not-a-directory.txt"
+        occupied.write_text("x", encoding="utf-8")
+        code, out, err = self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--parts", "3", "--out", str(occupied)]
+        )
+        self.assertNotEqual(code, 0)
+        printed = out + err
+        self.assertNotIn("Traceback", printed)
+        self.assertNotIn("FileExistsError", printed)
+
+    def test_an_option_without_its_value_is_refused(self):
+        # `_option` returns None both for "absent" and for "present with no
+        # value", so a trailing `--parts` silently meant "every part". `--quality`
+        # already had this guard; the rest did not.
+        for option in ("--parts", "--out", "--audio-out"):
+            with self.subTest(option=option):
+                code, out, err = self._run_main(
+                    ["transcript", "BV1Y5QgB5Eas", "--out", str(self.tmp / "o"), option]
+                )
+                self.assertNotEqual(code, 0)
+                self.assertIn(option, out + err)
+
+    def test_a_withheld_tier_is_never_read_from_a_part_duration_of_zero(self):
+        # `probe` fills a missing duration with 0.0, and a zero-second part made
+        # the completeness check accept a one-byte file as a finished
+        # transcript. Skipping on that basis would silently drop the content.
+        incomplete = self.tmp / "one-byte.txt"
+        incomplete.write_bytes(b"x")
+        self.assertFalse(videokit.transcript_complete(incomplete, 0.0))
+        self.assertTrue(incomplete.exists())
+
+    def test_a_download_where_a_part_fails_exits_nonzero(self):
+        # The help text claimed exit 1 for "video/audio 有讲次失败" while the
+        # code returned 0 unconditionally, so the claim and the behaviour
+        # disagreed. Measured, two parts both failing still exited 0.
+        def failing_download(url, out_dir, parts=None, **kwargs):
+            raise videokit.VideoKitError("simulated failure")
+
+        original = videokit.download_video
+        videokit.download_video = failing_download
+        self.addCleanup(setattr, videokit, "download_video", original)
+        code, out, err = self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--parts", "3,4", "--out", str(self.tmp / "v")]
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("2", err)
+
+    def test_a_download_where_every_part_succeeds_exits_zero(self):
+        def ok_download(url, out_dir, parts=None, **kwargs):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            written = out_dir / f"{parts[0]:02d}.mp4"
+            written.write_bytes(b"x")
+            return [written]
+
+        original = videokit.download_video
+        videokit.download_video = ok_download
+        self.addCleanup(setattr, videokit, "download_video", original)
+        code, out, err = self._run_main(
+            ["video", "BV1Y5QgB5Eas", "--parts", "3,4", "--out", str(self.tmp / "v")]
+        )
+        self.assertEqual(code, 0)
 
 
 class ProbeOutput(unittest.TestCase):

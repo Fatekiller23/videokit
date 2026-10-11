@@ -35,7 +35,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 # yt-dlp writes its subtitle table to stdout, not to JSON. This is a known
 # Bilibili extractor limitation (yt-dlp issue #17527): `subtitles` comes back
@@ -1058,9 +1058,18 @@ def transcript_complete(path: Path, duration_sec: float) -> bool:
     second check is therefore length against the probed duration: a finished
     artifact carries at least `_MIN_CHARS_PER_SEC` characters per second of its
     part, and an interrupted one carries a fraction of that.
+
+    A non-positive duration cannot be checked this way, and is treated as
+    unverifiable rather than as a pass. `probe` fills a missing platform
+    duration with 0.0, and the length test against 0.0 accepts any non-empty
+    file: measured, a one byte file counted as a finished transcript. That would
+    skip a part on the strength of nothing, and skipping is the one outcome that
+    loses content silently, so this returns False and the part is fetched again.
     """
     path = Path(path)
     if not path.is_file():
+        return False
+    if duration_sec <= 0:
         return False
     try:
         text = path.read_bytes().decode("utf-8")
@@ -1383,6 +1392,19 @@ def transcripts(
     and a caller that already holds an engine passes it in as `engine`.
     """
     video = probe(video_url(url), cookies)
+    if parts is not None:
+        # A requested part number that does not exist has to be refused, not
+        # filtered away. Measured, `--parts 99` on a 30-part course silently
+        # selected nothing and reported "delivered 0 of 0 parts" while exiting
+        # zero, so a caller read a typo as a finished job. `_selected_parts`
+        # already refuses this for the download commands.
+        known = {part.index for part in video.parts}
+        unknown = [index for index in parts if index not in known]
+        if unknown:
+            raise VideoKitError(
+                f"这个视频没有第 {', '.join(str(i) for i in unknown)} 讲，"
+                f"可选范围是 1 到 {max(known) if known else 0}"
+            )
     selected = [
         part for part in video.parts if parts is None or part.index in parts
     ]
@@ -2015,7 +2037,7 @@ _USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
 # without appearing in the help.
 _SUBCOMMANDS: dict[str, tuple[str, str]] = {
     "probe": (
-        "videokit probe <BV号或链接> [--parts 3,4]",
+        "videokit probe <BV号或链接>",
         "探测。报告有多少讲、每讲多长、哪些有字幕、有哪些清晰度档位，"
         "并说明会员高码率档是否拿到。不下载任何文件数据。",
     ),
@@ -2052,6 +2074,10 @@ _OPTIONS_HELP = """选项
 
 # What a caller may type to ask for help, and what the module answers to.
 _HELP_FLAGS = ("-h", "--help")
+
+# Every option that takes a value. Named once so `_dispatch` can refuse a
+# trailing option for all of them, rather than each subcommand remembering.
+_VALUE_OPTIONS = ("--parts", "--out", "--audio-out", "--quality")
 
 
 def _wants_help(args: list[str]) -> bool:
@@ -2142,6 +2168,18 @@ def _dispatch(argv: list[str]) -> int:
         return _usage_error(f"unknown subcommand: {name}")
     if _wants_help(rest):
         return _print_help(name)
+    # Every option that takes a value is checked here, once, before any
+    # subcommand runs. A name present with nothing after it is a mistake in the
+    # request, and `_option` cannot tell that case from "not supplied", so
+    # leaving it to each subcommand let a trailing `--parts` mean "every part".
+    valueless = _valueless_option(rest, sorted(_VALUE_OPTIONS))
+    if valueless is not None:
+        return _usage_error(f"{valueless} 需要一个值")
+    out = _option(rest, "--out")
+    if out is not None:
+        refused = _refuse_occupied_out(Path(out))
+        if refused is not None:
+            return refused
     if name == "probe":
         return _probe_command(rest)
     if name == "video":
@@ -2296,6 +2334,16 @@ def _probe_command(rest: list[str]) -> int:
     references = _references(rest)
     if not references:
         return _usage_error("probe needs a BV号 or 链接")
+    # `probe` reports every part, so it has nothing to do with a part selection.
+    # Measured, `probe ... --parts 3` printed all 30 parts and exited zero, and
+    # the help used to offer the option, so the reader had no way to know the
+    # selection was being dropped. Refusing it is the honest answer.
+    selection = _option(rest, "--parts")
+    if selection is not None:
+        return _usage_error(
+            f"probe 报告全部讲次，不支持 --parts（收到 {selection}）。"
+            f"要只看某几讲，用 video / audio / transcript。"
+        )
     print("探测中，这一步要跑两次 yt-dlp，约 40 到 90 秒。", flush=True)
     try:
         video = probe(video_url(references[0]))
@@ -2384,6 +2432,7 @@ def _download_command(kind: str, rest: list[str], quality: str | None) -> int:
         flush=True,
     )
     total_written = 0
+    failed = 0
     for position, index in enumerate(selected, start=1):
         part = by_index[index]
         label = f"[{position}/{len(selected)}]"
@@ -2402,6 +2451,7 @@ def _download_command(kind: str, rest: list[str], quality: str | None) -> int:
             # still worth their file, and the failure is named here rather than
             # left to a count at the end.
             print(f"{label} 第 {index} 讲失败：{exc}", file=sys.stderr, flush=True)
+            failed += 1
             continue
         if written:
             total_written += len(written)
@@ -2415,8 +2465,16 @@ def _download_command(kind: str, rest: list[str], quality: str | None) -> int:
                 file=sys.stderr,
                 flush=True,
             )
+            failed += 1
     print(f"完成，共写出 {total_written} 个文件到 {out_dir}")
-    return 0
+    if failed:
+        print(f"有 {failed} 讲失败，见上面的错误行。", file=sys.stderr)
+    # Same rule as `transcript`: the caller of this entry point is often another
+    # program, and it sees the exit code rather than this module's values. A run
+    # where parts failed must not be readable as complete. The help used to
+    # claim this exit code while the code always returned 0, so the claim and
+    # the behaviour disagreed.
+    return 1 if failed else 0
 
 
 def _video_command(rest: list[str]) -> int:
@@ -2670,13 +2728,56 @@ def _safe_console(stream):
 
 
 def _option(args: list[str], name: str) -> str | None:
-    """The value of `name`, or None when it is absent."""
+    """The value of `name`, or None when it is absent.
+
+    A `name` present with nothing after it also yields None, which is why
+    callers that care must use `_valueless_option` first. Measured, a trailing
+    `--parts` read as "every part" and downloaded all 30 while reporting
+    success, because absent and valueless were the same answer.
+    """
     if name not in args:
         return None
     position = args.index(name)
     if position + 1 >= len(args):
         return None
     return args[position + 1]
+
+
+def _valueless_option(args: list[str], names: Sequence[str]) -> str | None:
+    """The first of `names` that appears with no value after it, or None.
+
+    Every occurrence is checked, not just the first. Measured, `--out dir --out`
+    was reported as fine because `index()` finds the earlier occurrence, which
+    does carry a value, and the trailing one is the one with nothing after it.
+
+    Checked before anything is fetched, so an incomplete command line costs a
+    message rather than a network round trip. `--quality` already had this
+    guard on its own; this generalises it so the other options cannot be
+    forgotten.
+    """
+    for name in names:
+        positions = [i for i, arg in enumerate(args) if arg == name]
+        if positions and positions[-1] + 1 >= len(args):
+            return name
+    return None
+
+
+def _refuse_occupied_out(out_dir: Path) -> int | None:
+    """Refuse an `--out` that is an existing non-directory, before fetching.
+
+    Measured, `--out some-file.txt` reached `mkdir` and raised FileExistsError,
+    so the user saw a Python traceback. User story 14 asks for a message that
+    names the problem instead of a raw low-level error.
+    """
+    target = Path(out_dir)
+    if target.exists() and not target.is_dir():
+        print(
+            f"--out 指向的是已存在的文件，不是目录：{target}\n"
+            f"换一个目录，或先把它删掉。",
+            file=sys.stderr,
+        )
+        return 1
+    return None
 
 
 if __name__ == "__main__":
