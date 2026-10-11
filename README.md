@@ -1,8 +1,8 @@
 # VideoKit
 
-B 站视频的探测与下载。给一个链接，先告诉你有多少讲、哪些有字幕、有哪些清晰度可选，再按你的选择把视频或音频下下来。
+B 站视频的探测、下载与转文稿。给一个链接，先告诉你有多少讲、哪些有字幕、有哪些清晰度可选，再按你的选择把视频或音频下下来。
 
-有字幕的讲次可以直接产出交付文稿，一条命令跑完；无字幕的讲次记为待 ASR。本地语音识别本身是同一子项目的另一块，不在本包内。
+有字幕的讲次可以直接产出交付文稿，一条命令跑完；无字幕的讲次记为待 ASR，再由本地的语音识别路径转成带时间戳的文稿。
 
 ## 它解决什么
 
@@ -10,7 +10,7 @@ B 站视频的探测与下载。给一个链接，先告诉你有多少讲、哪
 
 同一门课里两种状态会混着出现。实测 `BV1Y5QgB5Eas`（徐高 2025 年宏观课，30 讲），21 讲有字幕、9 讲没有，且与讲次时长无相关性。所以必须逐讲判定，不能按整条视频二选一。
 
-## 六个入口
+## 七个入口
 
 ```
 probe(url, cookies=None) -> Video
@@ -24,6 +24,10 @@ transcript_text(segments) -> str
 
 transcripts(url, out_dir, parts=None, cookies=None) -> tuple[PartTranscript, ...]
     一条命令跑完。逐讲判定，有字幕的写出交付文件，无字幕的记为待 ASR。
+
+transcribe(wav, engine=None, device="cpu") -> list[Segment]
+    把一讲的 16 kHz 单声道 WAV 转成带时间戳的分段。缺 ASR 依赖时抛
+    TranscriptionUnavailable。
 
 download_video(url, out_dir, parts=None, quality="720p", cookies=None) -> list[Path]
     下视频。自动合并分开的音视频流。
@@ -193,6 +197,66 @@ records = videokit.transcripts("BV1Y5QgB5Eas", Path("transcripts"))
 
 `Segment` 的 `start_sec` / `end_sec` 是独立字段，`transcript_text` 只用 `text`。测试同时断言交付内容里没有 `-->`、没有 `HH:MM:SS`、也没有秒数的小数写法。
 
+## 语音识别
+
+```
+transcribe(wav, engine=None, device="cpu") -> list[Segment]
+```
+
+输入是一讲的 16 kHz 单声道 WAV，就是 `download_audio` 落下来的那个文件。输出是与平台字幕路径同一个 `Segment` 结构，带 `start_sec`、`end_sec` 和正文。
+
+引擎是 `paraformer-zh` + `fsmn-vad` + `ct-punc`，全部是必需项，见 `engine_kwargs`。
+
+**`ct-punc` 不是可选优化。** 实测关掉它后输出变成逐字之间带空格，3023 个字符里 1511 个空格，零标点。它同时负责把逐字标记拼回连续文本。没有标点就没有可分段的位置，这条链路上游就没有产物。
+
+**模型一次加载、反复使用。** 加载 29 到 50 秒，是每讲都要付的成本，所以引擎从 `engine=` 传进来。跑 30 讲时加载一次，不要每讲重来。
+
+**CPU 够用。** 实测 47.5 分钟音频约 209 秒，13.7 倍实时。不必为 GPU 做额外适配。
+
+### 时间戳配对规则
+
+`result["timestamp"]` 是毫秒对的列表，但**它的长度不等于文本长度**。实测一讲 52.7 分钟的完整运行，`len(text)` 是 17123，`len(timestamp)` 是 15908。
+
+规则是**一个汉字，或一整段连续的 ASCII 字母数字，消耗一对毫秒。标点与空白不消耗。**
+
+实测算术。15883 个汉字加 25 段 ASCII 连续串等于 15908，与 `len(timestamp)` 精确相等。反证也干净，按「每字符一对」假设会多出 61 对，正好等于 25 段 ASCII 串内部多算的字母数（`GDP` 23 次、`WTO` 9 次等）。
+
+所以配对不能按字符下标做。`recognised_units` 用一条正则切出单元，`asr_segments` 按单元下标取时间。
+
+**两个数不相等时抛 `AsrError`，不猜。** 错配之后任何一种配对都能产出看着像样的文稿，这正是要拒绝的失败模式。
+
+### 分段边界是标点
+
+`text` 里每出现一个标点就断一段。实现是扫文本找标点，**不读 `sentence_info`**。
+
+理由是 `sentence_info` 的文本在长音频上是错的。FunASR 1.4.16 里 `ct-punc` 的分词把 15088 个空格词展开成 15908 个标点 id，而句子拼接函数用 `text_postprocessed.split()` 去配这 15908 个 id，两边对不上。实测完整运行上从第 318 个字符起文本归属错位，拼接后 17165 字符对不上真实的 17123。**它的 `start` 与 `end` 毫秒是对的，文本不是。** 自算规则与它的 1152 段毫秒边界逐段相等，0 处不同，所以自己断没有损失。
+
+**分界标点必须包含 `.` 与 `,`。** 它们是 `ct-punc` 给 ASCII 词加的西文标点。实测只用 `，。？！、` 得到 1148 段，加上这两个得到 1152 段，与 `sentence_info` 精确相等。
+
+### 设备校验
+
+**必须读实际设备，不能信传进去的参数。** 实测把 `device="cuda:0"` 传给一台 `torch.cuda.is_available()` 为 `False` 的机器，FunASR 静默降级到 CPU，不报错不警告，转写结果完全正常。
+
+读法是 `next(model.model.parameters()).device`。三个看起来能用的属性都不可用。
+
+| 属性 | 实际情况 |
+|---|---|
+| `model.device` | 抛 `AttributeError`，不存在 |
+| `model.model.device` | 返回 `None`，**看着像「没有设备信息」，是假象** |
+| `next(model.model.parameters()).device` | 正确，用这个 |
+
+`verify_device(model, requested)` 在设备不符时抛 `AsrError`，`transcribe` 在读音频之前就调用它，所以降级会在启动时报出来，而不是几分钟工作量之后。
+
+### 口语填充词保留，是有意的
+
+**「啊」「呢」「就是」「这个」全部保留，不做清理。这不是识别缺陷，是本包的有意取舍，不要当 bug 修。**
+
+实测一讲 52.7 分钟的完整运行里，「啊」出现 277 次、「这个」424 次、「就是」60 次、「呃」89 次，全部留在文本里。
+
+理由是文稿的用途是让人读这门课讲了什么，而填充词是讲课风格的一部分。清掉它们会让不同讲次的文风看起来比实际更整齐，也会让引用原文时对不上音频。同一门课的平台字幕路径同样保留填充词，两条路径在这一点上一致。
+
+清理若要加，应该是显式的后处理步骤、带自己的开关，而不是藏在转写里的默认行为。
+
 ## 登录态
 
 B 站字幕未登录拿不到，所以要先登录一次。取凭据由程序引导，不需要手工导出 Cookie 文件。
@@ -302,7 +366,7 @@ Video
 Segment
   start_sec       分段起始秒，浮点
   end_sec         分段结束秒，浮点
-  text            该段正文，不含时间戳，不含标点
+  text            该段正文，不含时间戳
 
 PartTranscript
   bvid            如 BV1Y5QgB5Eas
@@ -314,6 +378,11 @@ PartTranscript
   segments        Segment 元组
   status          "ok" | "pending" | "failed"
   failure_reason  None | "no_audio" | "asr_error"
+
+RecognisedUnit
+  start           单元在正文里的起始字符下标
+  end             结束下标
+  text            该单元文字，一个汉字或一段 ASCII 字母数字
 ```
 
 `source` 与交付文稿的分层见「`source` 只服务程序，不进交付文稿」。
@@ -322,13 +391,13 @@ PartTranscript
 
 `Part.has_subtitles` 是判断有没有字幕的入口，不要直接看 `subtitle_langs` 是否非空以外的条件。
 
-`Segment.text` 不含标点是上游数据本来的样子，见「平台字幕」一节。
+`Segment.text` 在两条路径上标点情况不同。平台字幕不含标点是上游数据本来的样子，见「平台字幕」一节；ASR 分段含标点，且边界就在标点上。
 
 ## 代码结构
 
 `videokit.py` 是全部实现。分三层。
 
-**`_run` 是唯一的边界。** 所有外部调用都从这里出去，其余全是纯函数。测试只替换这一个地方。它返回 `RunOutput(stdout, stderr)` 两个流，因为登录告警写在 stderr 而退出码是 0。
+**`_run` 是唯一的网络边界。** 所有 `yt-dlp` 调用都从这里出去。它返回 `RunOutput(stdout, stderr)` 两个流，因为登录告警写在 stderr 而退出码是 0。**模型是第二个边界，在 `transcribe` 的 `engine=` 参数上。** 其余全是纯函数。
 
 **`probe` 用两次 `yt-dlp` 调用，这是 B 站提取器的现状，不是设计偏好。**
 
@@ -361,6 +430,10 @@ PartTranscript
 
 **凭据问题与「这一讲没字幕」必须分开。** `part_transcript` 只捕获 `SubtitleUnavailable`，那是「这一讲要 ASR」。登录失效时每一讲都表现为无字幕轨，若把它也记成待 ASR，整门课会被交给 ASR 路径，而真正的补救动作是重新导出一次凭据。#13 为这种情况抛 `LoginRequired`，这里有意不接，让它带着下一步提示往上走。
 
+**`asr_segments` 是纯函数，输入是文本加时间戳列表。** 它不是从模型结果里直接取分段，而是按「一单元一对毫秒」重建。这样做是为了让配对与分段逻辑可以离线测，实测用保存的原始产物秒级返回，不需要网络、不需要 GPU、不需要模型。模型只出现在 `transcribe` 的一个参数上，周围的逻辑因此也能测。
+
+`recognised_units` 单独暴露出来，因为下标偏移是配对契约的一部分，不是内部细节。
+
 ## 下载的两处硬约束
 
 **路径来自 `yt-dlp` 的报告，不是猜文件名。** 用的是 `--print after_move:filepath`。输出模板里有 `%(...)s` 占位符，且后处理（合并、抽音频）会改扩展名，所以磁盘上的名字无法从模板推出来。
@@ -374,6 +447,8 @@ uv run --python 3.12 python test/test_videokit.py
 ```
 
 129 项断言，约 5 秒，不联网、不需要登录态。
+
+语音识别那一层另有 31 项断言，合计 119 项、约 4 秒，同样不需要 funasr、不需要 GPU、不联网。
 
 跑真实模块。已有的解析与下载测试**只替换 `_run`**，用录制好的真实 `yt-dlp` 输出做夹具。
 
@@ -396,6 +471,7 @@ CDP 那一层替换的是 WebSocket 对象。`cdp_cookies(ws)` 收一个已连�
 - `list-subs-valid-no-subs.txt`：有效凭据下一讲本就无字幕的运行。它与上面那份空表结构同形，是用来证明「空表不等于未登录」的对照件。
 - `subtitles-p12-slice.srt`、`subtitles-p18-slice.srt`：真字幕轨的连续切片，按行区间裁，保留末尾空行，所以 `4N+1` 成立。
 - `subtitle-print-part.txt`、`subtitle-print-no-track.txt`：真实的一次 `--print "%(requested_subtitles)j"` 回包，有轨与无轨各一份。无轨那份只有 3 字节，内容是 `NA`。
+- `asr-23.txt`、`asr-23.timestamp.json`：**一次真实 ASR 运行的原始产物**，3160.2 秒音频，17123 字符文本配 15908 对毫秒，逐字节 sha256 与实测记录一致。两者的长度不等正是配对规则要解释的事实，所以这份夹具不能被手工构造的样本替代。
 
 登录信号那三份由 `test/_record_login_signals.py` 重新录制，改站或换 yt-dlp 后要重跑一次。
 
@@ -426,6 +502,20 @@ uv run --python 3.12 python videokit.py transcript BV1Y5QgB5Eas --out transcript
 
 端到端的期望值可以逐条复算，全部来自实测而不来自实现。21 个文件里正文合计 454245 字符，这个数与源字幕逐字节统计相同。21 个文件里空格合计 290 个，等于源字幕本来就有的 235 个加插入的 55 个。每个文件都与 `transcript_text(parse_srt(源文件))` 逐字节相同。
 
+**真实语音识别另有手工脚本，不进测试套件。**
+
+```
+uv run --python 3.12 --extra asr python test/_live_asr.py
+```
+
+它跑真实的 47.5 分钟音频，约 4 分钟。默认读 `D:\projects\ecobuddy-notes\audio\06.wav`，即 `BV1Y5QgB5Eas_p6`。会打印加载与转写耗时、校验后的设备、分段数、标点覆盖率与填充词计数。跑之前不要设 `PYTHONIOENCODING`。
+
+**测试不依赖 funasr。** 这一条是硬要求，所以分两层处理。
+
+- 配对与分段是纯函数，夹具是真实运行的原始产物，不需要模型。
+- 设备校验与 `transcribe` 用一个假的引擎对象，它有 `model.model.parameters()` 与 `generate()` 两个被读到的属性。真实引擎由手工脚本覆盖。
+- 「缺依赖时说什么」这条测试用 `sys.modules["funasr"] = None` 模拟导入失败，所以在一台真没装 funasr 的机器上同样通过。
+
 ## 已知限制
 
 **环境变量 `PYTHONIOENCODING` 会让 `probe` 崩。** 实测，与本 ticket 无关，主检出同样复现。
@@ -445,13 +535,44 @@ uv run --python 3.12 python videokit.py transcript BV1Y5QgB5Eas --out transcript
 
 **平台字幕没有标点。** 这是已接受的取舍，不是本包的缺陷。详见「无标点是已接受的取舍」。交付文稿会是整条连续流，段落划分要靠另加策略，不在本包范围内。
 
+**两条路径的文稿风格不同。** 平台字幕无标点，ASR 有标点，同一门课的交付文稿里会混着两种风格。把平台字幕也过一遍标点恢复是可行的补救路径，代价是会重算原有时间戳，本期不做。
+
+**不做简繁转换。** 若将来需要，正确的包名是 `opencc`。另两个同名包会把「头发」错转成「頭發」，这个命名陷阱要记住。
+
+**ASR 分段粒度是句，不是词。** 对照过 `sentence_info` 的毫秒边界，逐段相等。词级时间戳虽然从 `timestamp` 能拿到，本包不产出。
+
 **只做 B 站。** 其他站点未测。
 
 **扫码超时默认 180 秒。** 超时后报「没检测到登录」，浏览器窗口会被关掉。重新跑一次即可。
 
 ## 依赖
 
-Python 侧只有 `websocket-client`，用于 CDP，写在 `pyproject.toml` 里。
+Python 侧基础依赖只有 `websocket-client`，用于 CDP，写在 `pyproject.toml` 里。
+
+**语音识别是可选 extra `asr`，约 2 GB，不进基础安装。** 探测、下载、字幕取回都不需要它。
+
+```
+uv sync --extra asr
+```
+
+三个包全部必需。
+
+| 包 | 作用 |
+|---|---|
+| `funasr` | 引擎，提供 `AutoModel` 与三个模型 |
+| `torch` | `funasr` 的张量后端 |
+| `kaldi-native-fbank` | 提特征的后端 |
+
+**第三个最容易漏。** 只装前两个时安装干净、模型也能加载，一直到送音频进去才抛错。实测 FunASR 在那种情况下的原文是
+
+```
+ImportError: torchaudio is not installed and neither is the kaldi-native-fbank fallback backend.
+FunASR needs one fbank backend for feature extraction.
+```
+
+两个后端任选其一都行。本包选 `kaldi-native-fbank`，因为它不绑 torch 版本，装 `torchaudio` 则必须与所用 torch 版本匹配。
+
+模型首次使用时从 ModelScope 下载，本机缓存在 `%USERPROFILE%\.cache\modelscope\models\iic--*`。之后靠 `disable_update=True` 跳过联网检查。
 
 `yt-dlp` 与 `ffmpeg` 是两个外部程序，都不是 Python 包。
 
