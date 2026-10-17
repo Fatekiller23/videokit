@@ -180,7 +180,40 @@ class RunOutput:
     stderr: str
 
 
-def _run(args: list[str], cookies: Path | None) -> RunOutput:
+class _AnonymousCookies:
+    """Sentinel for "run without a credential and do not discover one".
+
+    `None` cannot mean this: it already means "discover the stored credential".
+    Kept private; the public entry points decide when anonymity is right.
+    """
+
+    def __repr__(self) -> str:
+        return "NO_COOKIES"
+
+
+NO_COOKIES = _AnonymousCookies()
+
+# One retry, for transport faults only. Measured on 2026-10-17, the same
+# anonymous structure call failed with "Remote end closed connection" on one
+# attempt and returned the 30-part JSON on the next. A permanent fault (a bad
+# URL, a withdrawn video) matches none of the markers and is raised at once.
+_RUN_ATTEMPTS = 2
+_RUN_RETRY_SLEEP_SEC = 3.0
+_TRANSIENT_ERRORS = (
+    "Remote end closed connection",
+    "Connection reset",
+    "Connection aborted",
+    "timed out",
+    "Unable to download webpage",
+    "Unable to download JSON metadata",
+)
+
+
+def _transient(stderr: str) -> bool:
+    return any(marker in stderr for marker in _TRANSIENT_ERRORS)
+
+
+def _run(args: list[str], cookies: Path | None | _AnonymousCookies) -> RunOutput:
     """Run yt-dlp and return both streams, or raise with stderr attached.
 
     One place resolves credentials, so every caller gets the same behavior
@@ -199,36 +232,56 @@ def _run(args: list[str], cookies: Path | None) -> RunOutput:
     opened.
     """
     cmd = list(_ytdlp_command())
-    cookies = cookies if cookies is not None else default_cookies()
-    temporary: Path | None = None
-    if cookies is not None:
-        # yt-dlp writes the cookie jar back after every run, and on Windows its
-        # writer uses CRLF. The next call then sends a trailing CR as part of
-        # each cookie value. Measured 2026-10-17: after one run the stored file
-        # had 28 CR bytes, and the next --dump-single-json failed with "Remote
-        # end closed connection without response" while --list-subs still
-        # worked. Hand yt-dlp a normalized copy and delete it afterwards, so a
-        # write-back cannot poison the stored credential and every run starts
-        # from LF regardless of what the previous run left behind.
-        descriptor, name = tempfile.mkstemp(prefix="videokit-cookies-", suffix=".txt")
-        os.close(descriptor)
-        temporary = Path(name)
-        temporary.write_text(
-            cookie_copy_text(Path(cookies)), encoding="utf-8", newline="\n"
-        )
-        cmd += ["--cookies", str(temporary)]
-    cmd += args
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise VideoKitError(f"could not execute {cmd[0]!r}: {exc}") from exc
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    if proc.returncode != 0:
+    if isinstance(cookies, _AnonymousCookies):
+        cookies = None
+    elif cookies is None:
+        cookies = default_cookies()
+
+    failure = ""
+    for attempt in range(_RUN_ATTEMPTS):
+        command = list(cmd)
+        temporary: Path | None = None
+        if cookies is not None:
+            # yt-dlp writes the cookie jar back after every run, and on Windows
+            # its writer uses CRLF. The next call then sends a trailing CR as
+            # part of each cookie value. Measured 2026-10-17: after one run the
+            # stored file had 28 CR bytes. Hand yt-dlp a normalized copy and
+            # delete it afterwards, so a write-back cannot poison the stored
+            # credential and every run starts from LF.
+            descriptor, name = tempfile.mkstemp(
+                prefix="videokit-cookies-", suffix=".txt"
+            )
+            os.close(descriptor)
+            temporary = Path(name)
+            temporary.write_text(
+                cookie_copy_text(Path(cookies)), encoding="utf-8", newline="\n"
+            )
+            command += ["--cookies", str(temporary)]
+        command += args
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise VideoKitError(f"could not execute {command[0]!r}: {exc}") from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        if proc.returncode == 0:
+            return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
         tail = "\n".join((proc.stderr or "").splitlines()[-8:])
-        raise VideoKitError(f"yt-dlp failed (exit {proc.returncode}):\n{tail}")
-    return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
+        failure = f"yt-dlp failed (exit {proc.returncode}):\n{tail}"
+        if attempt + 1 < _RUN_ATTEMPTS and _transient(proc.stderr or ""):
+            time.sleep(_RUN_RETRY_SLEEP_SEC)
+            continue
+        break
+    raise VideoKitError(failure)
+
+
+# The four cookies the session needs. Measured 2026-10-17: with the full
+# 20-cookie jar yt-dlp's subtitle request hung or was reset; with these four it
+# listed all 30 parts in 56 seconds. Tracking cookies are not part of auth.
+_AUTH_COOKIE_NAMES = frozenset(
+    {"SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5"}
+)
 
 
 def cookie_copy_text(path: Path) -> str:
@@ -236,10 +289,11 @@ def cookie_copy_text(path: Path) -> str:
 
     Two normalizations, both measured on this machine on 2026-10-17.
 
-    **One row per cookie name.** The stored file carries SESSDATA for
-    `.bilibili.com` and for `.bilibili.cn` with different values. yt-dlp sends
-    both, and the site resets the connection for the JSON metadata request.
-    The `.com` row wins because that is the domain the platform serves.
+    **Only the four cookies auth needs.** The stored file carries about 20,
+    including a second SESSDATA for `.bilibili.cn` with a different value.
+    yt-dlp sends them all, and the site hung or reset the subtitle request.
+    The four in `_AUTH_COOKIE_NAMES`, one row each, worked in 56 seconds. The
+    `.com` row wins because that is the domain the platform serves.
 
     **LF line endings.** yt-dlp writes the jar back with CRLF on Windows, and
     the next run then sends the trailing CR as part of every value. The copy
@@ -263,6 +317,8 @@ def cookie_copy_text(path: Path) -> str:
         if len(fields) < 7:
             continue
         name = fields[5]
+        if name not in _AUTH_COOKIE_NAMES:
+            continue
         existing = rows.get(name)
         if existing is None:
             order.append(name)
@@ -854,9 +910,14 @@ def probe(url: str, cookies: Path | None = None) -> Video:
     would otherwise get 30 parts that all report no subtitles, send every one
     of them to speech recognition, and never learn why.
     """
+    # The structure JSON is public. Measured on 2026-10-17, sending the
+    # stored credential with this call made the site reset the connection
+    # while the same call anonymously returned the full 30-part JSON in 35
+    # seconds. The credential is still needed for the subtitle table below,
+    # which is why it is passed there and nowhere else.
     raw = _run(
         ["--dump-single-json", "--skip-download", url],
-        cookies,
+        NO_COOKIES,
     ).stdout
     data = json.loads(raw)
     subs_run = _run(["--list-subs", "--skip-download", url], cookies)

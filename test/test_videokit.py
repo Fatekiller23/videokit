@@ -477,7 +477,8 @@ class CredentialFile(unittest.TestCase):
             "# Netscape HTTP Cookie File\r\n"
             ".bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tCOM\r\n"
             ".bilibili.cn\tTRUE\t/\tTRUE\t0\tSESSDATA\tCN\r\n"
-            ".bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tJ\r\n",
+            ".bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tJ\r\n"
+            ".bilibili.com\tTRUE\t/\tTRUE\t0\tbuvid3\tTRACKING\r\n",
             encoding="utf-8",
         )
         text = videokit.cookie_copy_text(source)
@@ -485,6 +486,9 @@ class CredentialFile(unittest.TestCase):
         self.assertEqual(text.count("SESSDATA"), 1)
         self.assertIn("SESSDATA\tCOM", text)
         self.assertIn("bili_jct\tJ", text)
+        # The tracking cookies were the ones that made the site reset the
+        # request, measured 2026-10-17, so they do not travel.
+        self.assertNotIn("buvid3", text)
 
     def test_writes_lf_even_on_windows(self):
         # yt-dlp sends the trailing byte of each line as part of the cookie
@@ -600,6 +604,18 @@ class DefaultCredentials(unittest.TestCase):
             self.assertNotIn("\r", text)
             self.assertEqual(text.count("SESSDATA"), 1)
 
+    def test_probe_fetches_the_structure_without_the_credential(self):
+        # The JSON is public; sending the credential with it made the site
+        # reset the request on 2026-10-17. The subtitle call still uses it.
+        videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
+        videokit.probe("u")
+        dumps = [cmd for cmd in self.commands if "--dump-single-json" in cmd]
+        self.assertEqual(len(dumps), 1)
+        self.assertNotIn("--cookies", dumps[0])
+        listed = [cmd for cmd in self.commands if "--list-subs" in cmd]
+        self.assertEqual(len(listed), 1)
+        self.assertIn("--cookies", listed[0])
+
     def test_both_downloads_use_the_stored_credential(self):
         videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
         videokit.download_audio("u", self.out, parts=[1])
@@ -652,6 +668,65 @@ class DefaultCredentials(unittest.TestCase):
         videokit.probe("u")
         self.assertEqual(source.read_bytes(), before)
         self.assertNotIn(b"\r", source.read_bytes())
+
+
+class TransientRetry(unittest.TestCase):
+    """One transport fault is retried; a permanent one is not."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="videokit-test-"))
+        self.addCleanup(self._cleanup)
+        os.environ["VIDEOKIT_DATA_DIR"] = str(self.tmp)
+        self.addCleanup(os.environ.pop, "VIDEOKIT_DATA_DIR", None)
+        self.original = subprocess.run
+
+    def _cleanup(self):
+        for child in sorted(self.tmp.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+        self.tmp.rmdir()
+
+    def test_a_reset_is_retried_once(self):
+        calls = []
+
+        def flaky(cmd, **kwargs):
+            calls.append(list(cmd))
+
+            class R:
+                returncode = 1 if len(calls) == 1 else 0
+                stdout = MULTI_DUMP if "--dump-single-json" in cmd else MULTI_SUBS
+                stderr = (
+                    "ERROR: [BiliBili] 1: Unable to download webpage: "
+                    "Remote end closed connection without response"
+                    if len(calls) == 1
+                    else ""
+                )
+
+            return R()
+
+        subprocess.run = flaky
+        self.addCleanup(setattr, subprocess, "run", self.original)
+        video = videokit.probe("u")
+        self.assertEqual(len(video.parts), 30)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_permanent_fault_is_not_retried(self):
+        calls = []
+
+        def broken(cmd, **kwargs):
+            calls.append(list(cmd))
+
+            class R:
+                returncode = 1
+                stdout = ""
+                stderr = "ERROR: Unsupported URL: u"
+
+            return R()
+
+        subprocess.run = broken
+        self.addCleanup(setattr, subprocess, "run", self.original)
+        with self.assertRaises(videokit.VideoKitError):
+            videokit.probe("u")
+        self.assertEqual(len(calls), 1)
 
 
 class GitignoreCoverage(unittest.TestCase):
