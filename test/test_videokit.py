@@ -121,7 +121,7 @@ class Probe(unittest.TestCase):
         self.calls: list[list[str]] = []
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
@@ -181,7 +181,7 @@ class Download(unittest.TestCase):
         self.calls: list[list[str]] = []
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             # yt-dlp reports the paths it wrote; the module must return those
             # rather than guessing a filename from the output template.
@@ -341,7 +341,7 @@ class ProbeEvents(unittest.TestCase):
         self.addCleanup(setattr, videokit, "_run", self.original)
 
     def _both_calls_succeed(self):
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             return videokit.RunOutput(
                 MULTI_DUMP if "--dump-single-json" in args else MULTI_SUBS, ""
             )
@@ -364,7 +364,7 @@ class ProbeEvents(unittest.TestCase):
         self.assertEqual(events[0].attempt, 1)
 
     def test_a_stage_that_raises_is_reported_as_failed(self):
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 raise videokit.VideoKitError("the site went away")
             return videokit.RunOutput(MULTI_SUBS, "")
@@ -412,6 +412,177 @@ class ProbeEvents(unittest.TestCase):
             videokit.time.sleep = original_sleep
         self.assertEqual(attempts, [2])
         self.assertEqual(len(calls), 2)
+
+
+class ProbeTimeouts(unittest.TestCase):
+
+    def test_a_stalled_run_is_stopped_with_the_budget_it_was_given(self):
+        import subprocess as sp
+
+        original_popen = sp.Popen
+        original_kill = videokit._kill_tree
+        killed = []
+
+        class Child:
+            pid = 4321
+            returncode = None
+
+            def communicate(self, timeout=None):
+                if timeout is not None:
+                    raise sp.TimeoutExpired("cmd", timeout)
+                self.returncode = 1
+                return "", ""
+
+        sp.Popen = lambda *args, **kwargs: Child()
+        videokit._kill_tree = lambda child: killed.append(child.pid)
+        try:
+            with self.assertRaises(videokit.VideoKitError) as ctx:
+                videokit._run(["--version"], videokit.NO_COOKIES, timeout_sec=12.5)
+        finally:
+            sp.Popen = original_popen
+            videokit._kill_tree = original_kill
+        self.assertIn("12.5", str(ctx.exception))
+        self.assertEqual(killed, [4321])
+
+    def test_probe_names_the_stage_that_timed_out(self):
+        original = videokit._run
+
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
+            raise videokit._YtdlpTimeout(timeout_sec or 0)
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", original)
+        events = []
+        with self.assertRaises(videokit.VideoKitError) as ctx:
+            videokit.probe("u", on_event=events.append)
+        self.assertIn("读取视频结构", str(ctx.exception))
+        self.assertIn("60", str(ctx.exception))
+        self.assertEqual(
+            [(event.stage, event.kind) for event in events],
+            [("structure", "start"), ("structure", "fail")],
+        )
+
+    def test_probe_gives_each_call_its_stage_budget(self):
+        original = videokit._run
+        budgets = []
+
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
+            budgets.append(timeout_sec)
+            return videokit.RunOutput(
+                MULTI_DUMP if "--dump-single-json" in args else MULTI_SUBS, ""
+            )
+
+        videokit._run = fake_run
+        self.addCleanup(setattr, videokit, "_run", original)
+        videokit.probe("u")
+        self.assertEqual(budgets, [60.0, 90.0])
+
+
+class ProbeFastStructure(unittest.TestCase):
+
+    def setUp(self):
+        self.original_run = videokit._run
+        self.original_view = videokit._fetch_view
+        self.addCleanup(setattr, videokit, "_run", self.original_run)
+        self.addCleanup(setattr, videokit, "_fetch_view", self.original_view)
+
+    def _view(self):
+        return {
+            "bvid": "BV1Y5QgB5Eas",
+            "title": "测试课程",
+            "pages": [
+                {"page": 1, "cid": 111, "part": "第一讲", "duration": 60},
+                {"page": 2, "cid": 222, "part": "第二讲", "duration": 90},
+            ],
+        }
+
+    def test_formats_false_takes_the_parts_from_the_view_endpoint(self):
+        asked = []
+
+        def fake_view(bvid):
+            asked.append(bvid)
+            return self._view()
+
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
+            if "--dump-single-json" in args:
+                raise AssertionError("the yt-dlp structure call must not run")
+            return videokit.RunOutput(
+                "[info] Available subtitles for BV1Y5QgB5Eas_p1:\nLanguage Formats\nai-zh    srt\n",
+                "",
+            )
+
+        videokit._fetch_view = fake_view
+        videokit._run = fake_run
+        events = []
+        video = videokit.probe(
+            "https://www.bilibili.com/video/BV1Y5QgB5Eas/?spm_id_from=333.337.search-card.all.click",
+            formats=False,
+            on_event=events.append,
+        )
+        self.assertEqual(asked, ["BV1Y5QgB5Eas"])
+        self.assertEqual(
+            [part.id for part in video.parts],
+            ["BV1Y5QgB5Eas_p1", "BV1Y5QgB5Eas_p2"],
+        )
+        self.assertEqual(
+            [part.title for part in video.parts],
+            ["测试课程 p01 第一讲", "测试课程 p02 第二讲"],
+        )
+        self.assertEqual(video.parts[0].subtitle_langs, ("ai-zh",))
+        self.assertEqual(video.parts[1].subtitle_langs, ())
+        self.assertEqual(video.formats, ())
+        self.assertEqual(video.id, "BV1Y5QgB5Eas")
+        self.assertEqual(
+            [(event.stage, event.kind) for event in events],
+            [
+                ("structure", "start"),
+                ("structure", "done"),
+                ("subtitles", "start"),
+                ("subtitles", "done"),
+            ],
+        )
+
+    def test_formats_false_falls_back_without_a_bv(self):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
+            return videokit.RunOutput(
+                MULTI_DUMP if "--dump-single-json" in args else MULTI_SUBS, ""
+            )
+
+        videokit._run = fake_run
+        video = videokit.probe("https://b23.tv/abc", formats=False)
+        self.assertEqual(len(video.parts), 30)
+
+    def test_a_view_request_failure_is_reported(self):
+        import urllib.error
+
+        original = videokit.urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.URLError("connection refused")
+
+        videokit.urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, videokit.urllib.request, "urlopen", original)
+        with self.assertRaises(videokit.VideoKitError) as ctx:
+            videokit._fetch_view("BV1Y5QgB5Eas")
+        self.assertIn("B 站讲次接口请求失败", str(ctx.exception))
+
+    def test_a_view_error_code_is_reported(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"code": -404, "message": "not found"}'
+
+        original = videokit.urllib.request.urlopen
+        videokit.urllib.request.urlopen = lambda request, timeout=None: Response()
+        self.addCleanup(setattr, videokit.urllib.request, "urlopen", original)
+        with self.assertRaises(videokit.VideoKitError) as ctx:
+            videokit._fetch_view("BV1Y5QgB5Eas")
+        self.assertIn("-404", str(ctx.exception))
 
 
 class LoginSignal(unittest.TestCase):
@@ -466,7 +637,7 @@ class LoginRequiredMessage(unittest.TestCase):
         self.addCleanup(setattr, videokit, "_run", self.original)
 
     def _logged_out(self):
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(LOGGED_OUT_SUBS, LOGIN_WARNING)
@@ -502,7 +673,7 @@ class LoginRequiredMessage(unittest.TestCase):
     def test_a_valid_login_that_finds_no_subtitles_is_not_a_login_problem(self):
         # Same empty table, no warning. This video simply has no subtitles, so
         # it must come back as an ordinary Video rather than as an error.
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(VALID_NO_SUBS, "")
@@ -514,7 +685,7 @@ class LoginRequiredMessage(unittest.TestCase):
     def test_the_zero_signal_still_holds_for_a_real_course(self):
         # 21 of the 30 parts have subtitles, so a valid login is judged valid
         # even though 9 parts come back empty.
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(MULTI_SUBS, "")
@@ -622,7 +793,7 @@ class CredentialFile(unittest.TestCase):
 class DefaultCredentials(unittest.TestCase):
     """After one login, the three entry points find the credential on their own.
 
-    `subprocess.run` is stubbed rather than `_run`, so the command the module
+    `subprocess` is stubbed rather than `_run`, so the command the module
     actually builds is the thing under test. A test that stubs `_run` cannot
     see whether `--cookies` was passed at all.
     """
@@ -636,9 +807,10 @@ class DefaultCredentials(unittest.TestCase):
         self.commands: list[list[str]] = []
         self.cookie_paths: list[str] = []
         self.cookie_texts: list[str] = []
-        original = subprocess.run
+        original_run = subprocess.run
+        original_popen = subprocess.Popen
 
-        def fake_run(cmd, **kwargs):
+        def record(cmd):
             self.commands.append(list(cmd))
             if "--cookies" in cmd:
                 path = Path(cmd[cmd.index("--cookies") + 1])
@@ -647,16 +819,35 @@ class DefaultCredentials(unittest.TestCase):
                 # once the subprocess returns.
                 self.cookie_texts.append(path.read_text(encoding="utf-8"))
 
+        def output(cmd):
+            return MULTI_DUMP if "--dump-single-json" in cmd else MULTI_SUBS
+
+        def fake_run(cmd, **kwargs):
+            record(cmd)
+
             class R:
                 returncode = 0
-                # probe makes two calls and needs a real answer for each.
-                stdout = MULTI_DUMP if "--dump-single-json" in cmd else MULTI_SUBS
+                stdout = output(cmd)
                 stderr = ""
 
             return R()
 
+        class FakeChild:
+            pid = 1
+            returncode = 0
+
+            def __init__(self, cmd):
+                record(cmd)
+                self.stdout = output(cmd)
+                self.stderr = ""
+
+            def communicate(self, timeout=None):
+                return self.stdout, self.stderr
+
         subprocess.run = fake_run
-        self.addCleanup(setattr, subprocess, "run", original)
+        subprocess.Popen = lambda cmd, **kwargs: FakeChild(cmd)
+        self.addCleanup(setattr, subprocess, "run", original_run)
+        self.addCleanup(setattr, subprocess, "Popen", original_popen)
         self.out = self.tmp / "out"
 
     def _cleanup(self):
@@ -758,7 +949,26 @@ class TransientRetry(unittest.TestCase):
         self.addCleanup(self._cleanup)
         os.environ["VIDEOKIT_DATA_DIR"] = str(self.tmp)
         self.addCleanup(os.environ.pop, "VIDEOKIT_DATA_DIR", None)
-        self.original = subprocess.run
+        self.original_run = subprocess.run
+        self.original_popen = subprocess.Popen
+        self.addCleanup(setattr, subprocess, "run", self.original_run)
+        self.addCleanup(setattr, subprocess, "Popen", self.original_popen)
+
+    def _use(self, responder):
+        def popen(cmd, **kwargs):
+            result = responder(cmd, **kwargs)
+
+            class Child:
+                pid = 1
+                returncode = result.returncode
+
+                def communicate(self, timeout=None):
+                    return result.stdout, result.stderr
+
+            return Child()
+
+        subprocess.run = responder
+        subprocess.Popen = popen
 
     def _cleanup(self):
         for child in sorted(self.tmp.rglob("*"), reverse=True):
@@ -783,8 +993,7 @@ class TransientRetry(unittest.TestCase):
 
             return R()
 
-        subprocess.run = flaky
-        self.addCleanup(setattr, subprocess, "run", self.original)
+        self._use(flaky)
         video = videokit.probe("u")
         self.assertEqual(len(video.parts), 30)
         self.assertEqual(len(calls), 3)
@@ -802,8 +1011,7 @@ class TransientRetry(unittest.TestCase):
 
             return R()
 
-        subprocess.run = broken
-        self.addCleanup(setattr, subprocess, "run", self.original)
+        self._use(broken)
         with self.assertRaises(videokit.VideoKitError):
             videokit.probe("u")
         self.assertEqual(len(calls), 1)
@@ -1237,7 +1445,7 @@ class SubtitleRetrieval(unittest.TestCase):
         self.calls: list[list[str]] = []
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             return videokit.RunOutput(SUB_PRINT_PART, "")
 
@@ -1275,7 +1483,7 @@ class SubtitleRetrieval(unittest.TestCase):
     def test_a_language_other_than_ai_zh_can_be_named(self):
         # The language is a parameter, not a constant. A payload for another
         # track must be read back, not rejected because it is not `ai-zh`.
-        def other_language(args, cookies, on_retry=None):
+        def other_language(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             return videokit.RunOutput(
                 json.dumps(
@@ -1301,7 +1509,7 @@ class SubtitleRetrieval(unittest.TestCase):
     def test_a_part_without_a_track_raises_rather_than_returning_empty(self):
         # The failure mode this ticket exists to prevent. A caller told "an
         # empty list" would write an empty transcript and never notice.
-        def no_track(args, cookies, on_retry=None):
+        def no_track(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
 
@@ -1313,7 +1521,7 @@ class SubtitleRetrieval(unittest.TestCase):
     def test_the_two_outcomes_are_not_easily_confused(self):
         # Same part, same call shape. One outcome raises, the other returns a
         # list. Asserting both here keeps them from being conflated later.
-        def no_track(args, cookies, on_retry=None):
+        def no_track(args, cookies, on_retry=None, timeout_sec=None):
             return videokit.RunOutput(SUB_PRINT_NO_TRACK, "")
 
         videokit._run = no_track
@@ -1328,7 +1536,7 @@ class SubtitleRetrieval(unittest.TestCase):
     def test_a_track_that_parses_to_nothing_is_also_reported_as_missing(self):
         # A payload carrying an empty track is not a transcript. Returning []
         # here would put an empty transcript into the pipeline.
-        def empty_track(args, cookies, on_retry=None):
+        def empty_track(args, cookies, on_retry=None, timeout_sec=None):
             return videokit.RunOutput(
                 json.dumps({"ai-zh": {"ext": "srt", "data": ""}}), ""
             )
@@ -1340,7 +1548,7 @@ class SubtitleRetrieval(unittest.TestCase):
     def test_danmaku_is_not_treated_as_a_subtitle_track(self):
         # A danmaku-only payload carries no transcribable track, so it means
         # the same thing as no track at all.
-        def danmaku_only(args, cookies, on_retry=None):
+        def danmaku_only(args, cookies, on_retry=None, timeout_sec=None):
             return videokit.RunOutput(
                 json.dumps({"danmaku": {"ext": "xml", "url": "https://x"}}), ""
             )
@@ -1354,7 +1562,7 @@ class SubtitleRetrieval(unittest.TestCase):
         # warning on stderr this is the credential's fault, not the part's, and
         # the two send the caller to different remedies: one re-logs in, the
         # other queues speech recognition.
-        def logged_out(args, cookies, on_retry=None):
+        def logged_out(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             return videokit.RunOutput(SUB_PRINT_NO_TRACK, LOGIN_WARNING)
 
@@ -1512,7 +1720,7 @@ class PartJudgment(unittest.TestCase):
         # engine costs 29 to 50 seconds to load.
         self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -1688,7 +1896,7 @@ class PartJudgment(unittest.TestCase):
         # The probe table and the fetch can disagree, for instance if the
         # track was withdrawn between the two calls. The outcome is the same:
         # this part needs a transcript from somewhere, and ASR is that.
-        def empty_track(args, cookies, on_retry=None):
+        def empty_track(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--audio-format" in args:
                 return stub_run(str(self.audio / "12.wav"))
@@ -1709,7 +1917,7 @@ class PartJudgment(unittest.TestCase):
         # path, and cost about 39 minutes, in response to a problem that
         # re-exporting the credential fixes. `probe` is what sees the warning
         # first, and it refuses there.
-        def logged_out(args, cookies, on_retry=None):
+        def logged_out(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -1723,7 +1931,7 @@ class PartJudgment(unittest.TestCase):
         # The probe table says part 12 has a track and the fetch disagrees
         # because the login went stale between the two calls. That is not a
         # part needing ASR either, so it must not be silently transcribed.
-        def stale_on_fetch(args, cookies, on_retry=None):
+        def stale_on_fetch(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -1961,7 +2169,7 @@ class SkipExisting(unittest.TestCase):
         self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
         self.loads: list[str] = []
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -2278,7 +2486,7 @@ class BatchRun(unittest.TestCase):
         self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
         self.loads: list[str] = []
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -2402,7 +2610,7 @@ class BatchRun(unittest.TestCase):
         # `failure_reason = "no_audio"`, the batch carries on, and nothing is
         # written for it. `transcribe` must not be reached, because there is no
         # file to hand it.
-        def no_audio(args, cookies, on_retry=None):
+        def no_audio(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -2461,7 +2669,7 @@ class TranscriptCommand(unittest.TestCase):
         self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
         self.loads: list[str] = []
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -2644,7 +2852,7 @@ class TranscriptCommand(unittest.TestCase):
         self.assertIn("transcript", buffer.getvalue())
 
     def test_an_unavailable_video_exits_nonzero_with_the_reason(self):
-        def failing(args, cookies, on_retry=None):
+        def failing(args, cookies, on_retry=None, timeout_sec=None):
             raise videokit.VideoKitError("yt-dlp failed (exit 1): boom")
 
         videokit._run = failing
@@ -2658,7 +2866,7 @@ class TranscriptCommand(unittest.TestCase):
         # A stale login makes every part read as trackless. Transcribing in
         # that state would cost about 39 minutes and produce a full set of
         # transcripts from the wrong cause, so the run refuses instead.
-        def logged_out(args, cookies, on_retry=None):
+        def logged_out(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
             return stub_run(LOGGED_OUT_SUBS, LOGIN_WARNING)
@@ -2699,7 +2907,7 @@ class AsrPipeline(unittest.TestCase):
         )
         original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--audio-format" in args:
                 return stub_run(str(self.tmp / "01.wav"))
             return stub_run(SUB_PRINT_PART)
@@ -2835,7 +3043,7 @@ class FailureSurvival(unittest.TestCase):
         self.out = self.tmp / "transcripts"
         self.audio = self.tmp / "audio"
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -2907,7 +3115,7 @@ class FailureSurvival(unittest.TestCase):
         # Part 1 fails for want of audio, part 2 fails inside the engine. A
         # single field could not tell the caller that only one of the two is
         # worth retrying.
-        def one_part_has_no_audio(args, cookies, on_retry=None):
+        def one_part_has_no_audio(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -3370,7 +3578,7 @@ class DownloadProgress(unittest.TestCase):
         self.calls: list[list[str]] = []
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
@@ -3452,7 +3660,7 @@ class DownloadProgress(unittest.TestCase):
         # reports as an empty list. Silence there would look like success, and
         # so would exit 0: the part produced no file, which is the same outcome
         # as a download error and has to be visible to a caller the same way.
-        def writes_nothing(args, cookies, on_retry=None):
+        def writes_nothing(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
@@ -3568,7 +3776,7 @@ class ProbeMissingTiers(unittest.TestCase):
         videokit._run = self.original
 
     def _stub(self, premium_stream: str):
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             if premium_stream == "stdout":
@@ -3591,7 +3799,7 @@ class ProbeMissingTiers(unittest.TestCase):
         self.assertEqual(video.missing_tiers, ("1080P 高码率",))
 
     def test_a_run_that_withholds_nothing_reports_no_tier(self):
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(self.PLAIN_SUBS, "")
@@ -3686,7 +3894,7 @@ class RefusedBeforeFetching(unittest.TestCase):
         self.original_run = videokit._run
         self.original_engine = videokit.load_engine
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return stub_run(MULTI_DUMP)
@@ -3834,7 +4042,7 @@ class ProbeOutput(unittest.TestCase):
     def setUp(self):
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(self.PLAIN_SUBS + PREMIUM_LINE, "")
@@ -3942,7 +4150,7 @@ class TranscriptProgress(unittest.TestCase):
         self.engine = _Engine({"text": ASR_TEXT, "timestamp": ASR_TIMESTAMPS})
         self.loads: list[str] = []
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             self.calls.append(args)
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
@@ -4111,7 +4319,7 @@ class ConsoleEncoding(unittest.TestCase):
     def setUp(self):
         self.original = videokit._run
 
-        def fake_run(args, cookies, on_retry=None):
+        def fake_run(args, cookies, on_retry=None, timeout_sec=None):
             if "--dump-single-json" in args:
                 return videokit.RunOutput(MULTI_DUMP, "")
             return videokit.RunOutput(SUBS_TABLE + PREMIUM_LINE, "")
@@ -4178,7 +4386,7 @@ class ConsoleEncoding(unittest.TestCase):
     def test_the_failure_path_also_survives(self):
         # A reference the platform rejects carries a message the user must
         # read, so the error path needs the same treatment as the report.
-        def failing(args, cookies, on_retry=None):
+        def failing(args, cookies, on_retry=None, timeout_sec=None):
             raise videokit.VideoKitError("失败\U00020000原因")
 
         videokit._run = failing

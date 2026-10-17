@@ -34,7 +34,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Sequence
@@ -148,6 +148,14 @@ class VideoKitError(RuntimeError):
     """Raised when yt-dlp fails in a way the caller must handle."""
 
 
+class _YtdlpTimeout(VideoKitError):
+    """yt-dlp did not return before its wall-clock budget ran out."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"yt-dlp 在 {seconds:g} 秒内没有返回，已中止。")
+        self.seconds = seconds
+
+
 @lru_cache(maxsize=1)
 def _ytdlp_command() -> tuple[str, ...]:
     """Locate yt-dlp, preferring one on PATH and falling back to `uv tool run`.
@@ -214,10 +222,40 @@ def _transient(stderr: str) -> bool:
     return any(marker in stderr for marker in _TRANSIENT_ERRORS)
 
 
+def _start(command: list[str]) -> subprocess.Popen:
+    try:
+        return subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise VideoKitError(f"could not execute {command[0]!r}: {exc}") from exc
+
+
+def _kill_tree(child: subprocess.Popen) -> None:
+    """Kill yt-dlp and every process its launcher started.
+
+    On Windows the yt-dlp executable is a launcher that starts an interpreter
+    child. Killing the launcher alone leaves the child holding the pipe, so
+    communicate() would wait forever after the deadline. taskkill /T walks the
+    tree.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(child.pid), "/T", "/F"],
+            capture_output=True,
+        )
+    else:
+        child.kill()
+
+
 def _run(
     args: list[str],
     cookies: Path | None | _AnonymousCookies,
     on_retry: Callable[[int], None] | None = None,
+    timeout_sec: float | None = None,
 ) -> RunOutput:
     """Run yt-dlp and return both streams, or raise with stderr attached.
 
@@ -237,7 +275,8 @@ def _run(
     opened.
 
     `on_retry` is called with the number of the attempt about to begin when a
-    transport fault is retried.
+    transport fault is retried. `timeout_sec` is a wall-clock budget for the
+    process; a timeout ends the run instead of becoming a retry.
     """
     cmd = list(_ytdlp_command())
     if isinstance(cookies, _AnonymousCookies):
@@ -267,17 +306,34 @@ def _run(
             command += ["--cookies", str(temporary)]
         command += args
         try:
-            proc = subprocess.run(command, capture_output=True, text=True)
-        except FileNotFoundError as exc:
-            raise VideoKitError(f"could not execute {command[0]!r}: {exc}") from exc
+            if timeout_sec is None:
+                try:
+                    proc = subprocess.run(command, capture_output=True, text=True)
+                except FileNotFoundError as exc:
+                    raise VideoKitError(
+                        f"could not execute {command[0]!r}: {exc}"
+                    ) from exc
+                stdout, stderr = proc.stdout, proc.stderr
+                returncode = proc.returncode
+            else:
+                child = _start(command)
+                try:
+                    stdout, stderr = child.communicate(timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    # The attempt already spent its whole budget. Retrying
+                    # would only double the silence the caller shows.
+                    _kill_tree(child)
+                    child.communicate()
+                    raise _YtdlpTimeout(timeout_sec) from None
+                returncode = child.returncode
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        if proc.returncode == 0:
-            return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
-        tail = "\n".join((proc.stderr or "").splitlines()[-8:])
-        failure = f"yt-dlp failed (exit {proc.returncode}):\n{tail}"
-        if attempt < _RUN_ATTEMPTS and _transient(proc.stderr or ""):
+        if returncode == 0:
+            return RunOutput(stdout=stdout or "", stderr=stderr or "")
+        tail = "\n".join((stderr or "").splitlines()[-8:])
+        failure = f"yt-dlp failed (exit {returncode}):\n{tail}"
+        if attempt < _RUN_ATTEMPTS and _transient(stderr or ""):
             if on_retry is not None:
                 on_retry(attempt + 1)
             time.sleep(_RUN_RETRY_SLEEP_SEC)
@@ -914,6 +970,18 @@ PROBE_STAGES: tuple[tuple[str, str], ...] = (
     ("subtitles", "读取字幕表"),
 )
 
+# Wall-clock budgets for the two calls. Measured on 2026-10-18: a structure
+# call that would eventually fail sat for 144.8 seconds, and its retry added
+# another 70.5; successful structure calls took 27.6 to 35 seconds. Subtitle
+# calls measured 32.8 to 72 seconds. These budgets cut the failure wait
+# without clipping a measured success.
+PROBE_STAGE_TIMEOUTS: dict[str, float] = {"structure": 60.0, "subtitles": 90.0}
+
+
+def _timeout_message(stage: str, seconds: float) -> str:
+    label = dict(PROBE_STAGES).get(stage, stage)
+    return f"{label}超时（{seconds:g} 秒），已中止。B 站没有按时回应，再试一次。"
+
 
 @dataclass(frozen=True)
 class ProbeEvent:
@@ -956,15 +1024,88 @@ def _retry_notice(stage: str, listener: ProbeListener | None):
     return note
 
 
+_BVID = re.compile(r"(BV[0-9A-Za-z]{10})")
+_VIEW_API = "https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+_VIEW_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+_VIEW_TIMEOUT_SEC = 10.0
+
+
+def _fetch_view(bvid: str) -> dict:
+    """The part list from Bilibili's own view endpoint.
+
+    Measured on 2026-10-18: the same 30 parts came back in 0.25 seconds. The
+    yt-dlp structure call took 27.6 seconds when it worked and 144.8 seconds
+    when it did not, then spent another 70.5 on a retry. The endpoint has no
+    yt-dlp format table, so this path is only used for `formats=False`.
+    """
+    request = urllib.request.Request(
+        _VIEW_API.format(bvid=bvid),
+        headers={"User-Agent": _VIEW_UA},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_VIEW_TIMEOUT_SEC) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise VideoKitError(f"B 站讲次接口请求失败：{exc}") from exc
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        code = payload.get("code") if isinstance(payload, dict) else "?"
+        message = payload.get("message") if isinstance(payload, dict) else ""
+        raise VideoKitError(f"B 站讲次接口返回 {code}：{message or '没有说明'}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise VideoKitError("B 站讲次接口没有返回视频结构")
+    return data
+
+
+def _parts_from_view(bvid: str, data: dict) -> tuple[Part, ...]:
+    """The part list in the same shape the yt-dlp path produces.
+
+    The subtitle table is keyed by `BV..._p<N>`, not by the numeric cid the
+    endpoint returns, and yt-dlp titles a part with the video title, the
+    padded part number and the part title. Both are rebuilt here so a probe
+    means the same thing whichever structure call fed it.
+    """
+    pages = data.get("pages") or []
+    video_title = str(data.get("title") or "")
+    multiple = len(pages) > 1
+    parts = []
+    for position, page in enumerate(pages, start=1):
+        index = int(page.get("page") or position)
+        part_title = str(page.get("part") or "")
+        if multiple:
+            title = f"{video_title} p{index:02d} {part_title}".strip()
+            part_id = f"{bvid}_p{index}"
+        else:
+            title = video_title
+            part_id = bvid
+        parts.append(
+            Part(
+                index=index,
+                id=part_id,
+                title=title,
+                duration_sec=float(page.get("duration") or 0.0),
+                subtitle_langs=(),
+            )
+        )
+    return tuple(sorted(parts, key=lambda part: part.index))
+
+
 def probe(
     url: str,
     cookies: Path | None = None,
     on_event: ProbeListener | None = None,
+    formats: bool = True,
 ) -> Video:
     """Report what exists at `url` without downloading file data.
 
-    Two yt-dlp calls: JSON for structure and formats, `--list-subs` for
-    subtitles, because the JSON path does not expose subtitles for Bilibili.
+    `formats=True` runs yt-dlp's structure call, the only source of the
+    format table. `formats=False` takes the part list from Bilibili's view
+    endpoint in about 0.3 seconds and returns an empty format table. The
+    subtitle table still comes from `--list-subs`, because the JSON path does
+    not expose subtitles for Bilibili.
 
     Raises `LoginRequired` when the subtitle call came back with nothing and
     yt-dlp said a login was missing. Refusing here is the point: the caller
@@ -973,47 +1114,69 @@ def probe(
 
     `on_event` receives one `ProbeEvent` for each stage start, retry and end.
     """
-    # The structure JSON is public. Measured on 2026-10-17, sending the
-    # stored credential with this call made the site reset the connection
-    # while the same call anonymously returned the full 30-part JSON in 35
-    # seconds. The credential is still needed for the subtitle table below,
-    # which is why it is passed there and nowhere else.
-    with _probe_stage("structure", on_event):
-        raw = _run(
-            ["--dump-single-json", "--skip-download", url],
-            NO_COOKIES,
-            on_retry=_retry_notice("structure", on_event),
-        ).stdout
-        data = json.loads(raw)
+    bvid = _BVID.search(url)
+    fast = not formats and bvid is not None
+
+    if fast:
+        with _probe_stage("structure", on_event):
+            view = _fetch_view(bvid.group(1))
+            video_id = str(view.get("bvid") or bvid.group(1))
+            title = str(view.get("title") or "")
+            base_parts = _parts_from_view(bvid.group(1), view)
+    else:
+        # The structure JSON is public. Measured on 2026-10-17, sending the
+        # stored credential with this call made the site reset the connection
+        # while the same call anonymously returned the full 30-part JSON in 35
+        # seconds. The credential is still needed for the subtitle table below,
+        # which is why it is passed there and nowhere else.
+        with _probe_stage("structure", on_event):
+            try:
+                raw = _run(
+                    ["--dump-single-json", "--skip-download", url],
+                    NO_COOKIES,
+                    on_retry=_retry_notice("structure", on_event),
+                    timeout_sec=PROBE_STAGE_TIMEOUTS["structure"],
+                ).stdout
+            except _YtdlpTimeout as exc:
+                raise VideoKitError(_timeout_message("structure", exc.seconds)) from exc
+            data = json.loads(raw)
+            entries = data.get("entries") or [data]
+            video_id = str(data.get("id") or "")
+            title = str(data.get("title") or "")
+            base_parts = tuple(
+                Part(
+                    index=entry.get("playlist_index") or 1,
+                    id=str(entry.get("id", "")),
+                    title=str(entry.get("title", "")),
+                    duration_sec=float(entry.get("duration") or 0.0),
+                    subtitle_langs=(),
+                )
+                for entry in entries
+            )
+
     with _probe_stage("subtitles", on_event):
-        subs_run = _run(
-            ["--list-subs", "--skip-download", url],
-            cookies,
-            on_retry=_retry_notice("subtitles", on_event),
-        )
+        try:
+            subs_run = _run(
+                ["--list-subs", "--skip-download", url],
+                cookies,
+                on_retry=_retry_notice("subtitles", on_event),
+                timeout_sec=PROBE_STAGE_TIMEOUTS["subtitles"],
+            )
+        except _YtdlpTimeout as exc:
+            raise VideoKitError(_timeout_message("subtitles", exc.seconds)) from exc
         subs = parse_subtitle_table(subs_run.stdout)
         if login_needed(subs, subs_run.stderr):
             raise LoginRequired(login_required_message())
 
-    entries = data.get("entries") or [data]
-    parts = []
-    for entry in entries:
-        pid = entry.get("id", "")
-        parts.append(
-            Part(
-                index=entry.get("playlist_index") or 1,
-                id=pid,
-                title=entry.get("title", ""),
-                duration_sec=float(entry.get("duration") or 0.0),
-                subtitle_langs=subs.get(pid, ()),
-            )
-        )
+    parts = tuple(
+        replace(part, subtitle_langs=subs.get(part.id, ())) for part in base_parts
+    )
 
     return Video(
-        id=data.get("id", ""),
-        title=data.get("title", ""),
+        id=video_id,
+        title=title,
         parts=tuple(sorted(parts, key=lambda p: p.index)),
-        formats=tuple(entries[0].get("formats") or ()),
+        formats=() if fast else tuple(entries[0].get("formats") or ()),
         # Both streams, because the sentence's stream is not fixed. Measured
         # today it arrives on stdout with a working credential; the recorded
         # login warning shows the sibling signal arriving on stderr.
