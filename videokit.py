@@ -33,10 +33,11 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 # yt-dlp writes its subtitle table to stdout, not to JSON. This is a known
 # Bilibili extractor limitation (yt-dlp issue #17527): `subtitles` comes back
@@ -213,7 +214,11 @@ def _transient(stderr: str) -> bool:
     return any(marker in stderr for marker in _TRANSIENT_ERRORS)
 
 
-def _run(args: list[str], cookies: Path | None | _AnonymousCookies) -> RunOutput:
+def _run(
+    args: list[str],
+    cookies: Path | None | _AnonymousCookies,
+    on_retry: Callable[[int], None] | None = None,
+) -> RunOutput:
     """Run yt-dlp and return both streams, or raise with stderr attached.
 
     One place resolves credentials, so every caller gets the same behavior
@@ -230,6 +235,9 @@ def _run(args: list[str], cookies: Path | None | _AnonymousCookies) -> RunOutput
     UTF-8 turns every Chinese title into replacement characters. Those titles
     end up in filenames, so a wrong guess here produces paths that cannot be
     opened.
+
+    `on_retry` is called with the number of the attempt about to begin when a
+    transport fault is retried.
     """
     cmd = list(_ytdlp_command())
     if isinstance(cookies, _AnonymousCookies):
@@ -238,7 +246,7 @@ def _run(args: list[str], cookies: Path | None | _AnonymousCookies) -> RunOutput
         cookies = default_cookies()
 
     failure = ""
-    for attempt in range(_RUN_ATTEMPTS):
+    for attempt in range(1, _RUN_ATTEMPTS + 1):
         command = list(cmd)
         temporary: Path | None = None
         if cookies is not None:
@@ -269,7 +277,9 @@ def _run(args: list[str], cookies: Path | None | _AnonymousCookies) -> RunOutput
             return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
         tail = "\n".join((proc.stderr or "").splitlines()[-8:])
         failure = f"yt-dlp failed (exit {proc.returncode}):\n{tail}"
-        if attempt + 1 < _RUN_ATTEMPTS and _transient(proc.stderr or ""):
+        if attempt < _RUN_ATTEMPTS and _transient(proc.stderr or ""):
+            if on_retry is not None:
+                on_retry(attempt + 1)
             time.sleep(_RUN_RETRY_SLEEP_SEC)
             continue
         break
@@ -899,7 +909,58 @@ def _requested_track(payload: str, language: str) -> str | None:
     return data if isinstance(data, str) and data.strip() else None
 
 
-def probe(url: str, cookies: Path | None = None) -> Video:
+PROBE_STAGES: tuple[tuple[str, str], ...] = (
+    ("structure", "读取视频结构"),
+    ("subtitles", "读取字幕表"),
+)
+
+
+@dataclass(frozen=True)
+class ProbeEvent:
+    """One fact a probe reports while it runs.
+
+    `kind` is `"start"`, `"retry"`, `"done"` or `"fail"`. `attempt` names the
+    attempt now beginning and is set on `start` and `retry` only, because the
+    other two kinds end an attempt instead of opening one.
+    """
+
+    stage: str
+    kind: Literal["start", "retry", "done", "fail"]
+    attempt: int | None = None
+
+
+ProbeListener = Callable[[ProbeEvent], None]
+
+
+def _notify(listener: ProbeListener | None, event: ProbeEvent) -> None:
+    if listener is not None:
+        listener(event)
+
+
+@contextmanager
+def _probe_stage(stage: str, listener: ProbeListener | None):
+    """Report the start and the end of one yt-dlp call."""
+    _notify(listener, ProbeEvent(stage=stage, kind="start", attempt=1))
+    try:
+        yield
+    except Exception:
+        _notify(listener, ProbeEvent(stage=stage, kind="fail"))
+        raise
+    _notify(listener, ProbeEvent(stage=stage, kind="done"))
+
+
+def _retry_notice(stage: str, listener: ProbeListener | None):
+    def note(attempt: int) -> None:
+        _notify(listener, ProbeEvent(stage=stage, kind="retry", attempt=attempt))
+
+    return note
+
+
+def probe(
+    url: str,
+    cookies: Path | None = None,
+    on_event: ProbeListener | None = None,
+) -> Video:
     """Report what exists at `url` without downloading file data.
 
     Two yt-dlp calls: JSON for structure and formats, `--list-subs` for
@@ -909,21 +970,30 @@ def probe(url: str, cookies: Path | None = None) -> Video:
     yt-dlp said a login was missing. Refusing here is the point: the caller
     would otherwise get 30 parts that all report no subtitles, send every one
     of them to speech recognition, and never learn why.
+
+    `on_event` receives one `ProbeEvent` for each stage start, retry and end.
     """
     # The structure JSON is public. Measured on 2026-10-17, sending the
     # stored credential with this call made the site reset the connection
     # while the same call anonymously returned the full 30-part JSON in 35
     # seconds. The credential is still needed for the subtitle table below,
     # which is why it is passed there and nowhere else.
-    raw = _run(
-        ["--dump-single-json", "--skip-download", url],
-        NO_COOKIES,
-    ).stdout
-    data = json.loads(raw)
-    subs_run = _run(["--list-subs", "--skip-download", url], cookies)
-    subs = parse_subtitle_table(subs_run.stdout)
-    if login_needed(subs, subs_run.stderr):
-        raise LoginRequired(login_required_message())
+    with _probe_stage("structure", on_event):
+        raw = _run(
+            ["--dump-single-json", "--skip-download", url],
+            NO_COOKIES,
+            on_retry=_retry_notice("structure", on_event),
+        ).stdout
+        data = json.loads(raw)
+    with _probe_stage("subtitles", on_event):
+        subs_run = _run(
+            ["--list-subs", "--skip-download", url],
+            cookies,
+            on_retry=_retry_notice("subtitles", on_event),
+        )
+        subs = parse_subtitle_table(subs_run.stdout)
+        if login_needed(subs, subs_run.stderr):
+            raise LoginRequired(login_required_message())
 
     entries = data.get("entries") or [data]
     parts = []
@@ -2481,8 +2551,20 @@ def _probe_command(rest: list[str]) -> int:
             f"要只看某几讲，用 video / audio / transcript。"
         )
     print("探测中，这一步要跑两次 yt-dlp，约 40 到 90 秒。", flush=True)
+    labels = dict(PROBE_STAGES)
+
+    def show(event: ProbeEvent) -> None:
+        label = labels.get(event.stage, event.stage)
+        if event.kind == "start":
+            print(f"  {label}…", flush=True)
+        elif event.kind == "retry":
+            print(
+                f"  {label} 中断，{_RUN_RETRY_SLEEP_SEC:g} 秒后重试（第 {event.attempt} 次）",
+                flush=True,
+            )
+
     try:
-        video = probe(video_url(references[0]))
+        video = probe(video_url(references[0]), on_event=show)
     except VideoKitError as exc:
         print(f"probe failed: {exc}", file=sys.stderr)
         return 1
