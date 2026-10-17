@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -199,17 +200,78 @@ def _run(args: list[str], cookies: Path | None) -> RunOutput:
     """
     cmd = list(_ytdlp_command())
     cookies = cookies if cookies is not None else default_cookies()
+    temporary: Path | None = None
     if cookies is not None:
-        cmd += ["--cookies", str(cookies)]
+        # yt-dlp writes the cookie jar back after every run, and on Windows its
+        # writer uses CRLF. The next call then sends a trailing CR as part of
+        # each cookie value. Measured 2026-10-17: after one run the stored file
+        # had 28 CR bytes, and the next --dump-single-json failed with "Remote
+        # end closed connection without response" while --list-subs still
+        # worked. Hand yt-dlp a normalized copy and delete it afterwards, so a
+        # write-back cannot poison the stored credential and every run starts
+        # from LF regardless of what the previous run left behind.
+        descriptor, name = tempfile.mkstemp(prefix="videokit-cookies-", suffix=".txt")
+        os.close(descriptor)
+        temporary = Path(name)
+        temporary.write_text(
+            cookie_copy_text(Path(cookies)), encoding="utf-8", newline="\n"
+        )
+        cmd += ["--cookies", str(temporary)]
     cmd += args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError as exc:
         raise VideoKitError(f"could not execute {cmd[0]!r}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").splitlines()[-8:])
         raise VideoKitError(f"yt-dlp failed (exit {proc.returncode}):\n{tail}")
     return RunOutput(stdout=proc.stdout or "", stderr=proc.stderr or "")
+
+
+def cookie_copy_text(path: Path) -> str:
+    """Normalize a stored cookie file for one yt-dlp run.
+
+    Two normalizations, both measured on this machine on 2026-10-17.
+
+    **One row per cookie name.** The stored file carries SESSDATA for
+    `.bilibili.com` and for `.bilibili.cn` with different values. yt-dlp sends
+    both, and the site resets the connection for the JSON metadata request.
+    The `.com` row wins because that is the domain the platform serves.
+
+    **LF line endings.** yt-dlp writes the jar back with CRLF on Windows, and
+    the next run then sends the trailing CR as part of every value. The copy
+    is always LF, and the stored file is never handed to yt-dlp, so its
+    write-back cannot poison the next run.
+
+    The result is a throwaway copy. The stored file keeps its permissions and
+    its bytes, and tests assert that it is unchanged after a run.
+    """
+    header: list[str] = []
+    rows: dict[str, str] = {}
+    order: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            header.append(line)
+            continue
+        body = line[len("#HttpOnly_") :] if line.startswith("#HttpOnly_") else line
+        fields = body.split("\t")
+        if len(fields) < 7:
+            continue
+        name = fields[5]
+        existing = rows.get(name)
+        if existing is None:
+            order.append(name)
+            rows[name] = line
+            continue
+        existing_domain = existing.split("\t")[0].removeprefix("#HttpOnly_")
+        if ".bilibili.com" in fields[0] or ".bilibili.com" not in existing_domain:
+            rows[name] = line
+    return "\n".join(header + [rows[name] for name in order]) + "\n"
 
 
 def netscape_text(cookies: list[dict]) -> str:

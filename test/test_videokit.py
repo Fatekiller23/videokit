@@ -468,6 +468,24 @@ class CredentialFile(unittest.TestCase):
         videokit.save_cookies(CDP_COOKIES, target)
         self.assertEqual(rows(target.read_text(encoding="utf-8")), NETSCAPE_REFERENCE)
 
+    def test_a_copy_keeps_one_row_per_cookie_name(self):
+        # The stored file carries SESSDATA for .bilibili.com and .bilibili.cn.
+        # Sending both makes the site reset the JSON metadata request, so the
+        # copy keeps the .com row and drops the twin.
+        source = self.tmp / "cookies.txt"
+        source.write_text(
+            "# Netscape HTTP Cookie File\r\n"
+            ".bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tCOM\r\n"
+            ".bilibili.cn\tTRUE\t/\tTRUE\t0\tSESSDATA\tCN\r\n"
+            ".bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tJ\r\n",
+            encoding="utf-8",
+        )
+        text = videokit.cookie_copy_text(source)
+        self.assertNotIn("\r", text)
+        self.assertEqual(text.count("SESSDATA"), 1)
+        self.assertIn("SESSDATA\tCOM", text)
+        self.assertIn("bili_jct\tJ", text)
+
     def test_writes_lf_even_on_windows(self):
         # yt-dlp sends the trailing byte of each line as part of the cookie
         # value. A CRLF file reset the JSON metadata request on the real site,
@@ -532,10 +550,18 @@ class DefaultCredentials(unittest.TestCase):
         self.addCleanup(os.environ.pop, "VIDEOKIT_DATA_DIR", None)
 
         self.commands: list[list[str]] = []
+        self.cookie_paths: list[str] = []
+        self.cookie_texts: list[str] = []
         original = subprocess.run
 
         def fake_run(cmd, **kwargs):
             self.commands.append(list(cmd))
+            if "--cookies" in cmd:
+                path = Path(cmd[cmd.index("--cookies") + 1])
+                self.cookie_paths.append(str(path))
+                # Read it while the call is in flight. _run deletes the copy
+                # once the subprocess returns.
+                self.cookie_texts.append(path.read_text(encoding="utf-8"))
 
             class R:
                 returncode = 0
@@ -568,30 +594,64 @@ class DefaultCredentials(unittest.TestCase):
         videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
         video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
         self.assertEqual(len(video.parts), 30)
-        self.assertEqual(
-            self._cookies_used(), {str(videokit.credentials_path())}
-        )
+        self.assertNotIn(str(videokit.credentials_path()), self.cookie_paths)
+        self.assertTrue(self.cookie_texts)
+        for text in self.cookie_texts:
+            self.assertNotIn("\r", text)
+            self.assertEqual(text.count("SESSDATA"), 1)
 
     def test_both_downloads_use_the_stored_credential(self):
         videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
         videokit.download_audio("u", self.out, parts=[1])
         videokit.download_video("u", self.out, parts=[1])
-        self.assertEqual(
-            self._cookies_used(), {str(videokit.credentials_path())}
-        )
+        self.assertNotIn(str(videokit.credentials_path()), self.cookie_paths)
+        self.assertTrue(self.cookie_texts)
+        for text in self.cookie_texts:
+            self.assertNotIn("\r", text)
+            self.assertEqual(text.count("SESSDATA"), 1)
 
     def test_an_explicit_argument_overrides_the_stored_credential(self):
         videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
         other = self.tmp / "other.txt"
-        videokit.save_cookies(CDP_COOKIES, other)
+        subset = CDP_COOKIES[:2]
+        videokit.save_cookies(subset, other)
         videokit.download_audio("u", self.out, cookies=other)
-        self.assertEqual(self._cookies_used(), {str(other)})
+        self.assertNotIn(str(other), self.cookie_paths)
+        expected = videokit.cookie_copy_text(other)
+        self.assertTrue(self.cookie_texts)
+        self.assertTrue(all(text == expected for text in self.cookie_texts))
 
     def test_no_stored_credential_means_an_anonymous_call(self):
         # Never having logged in is a normal state. It must not raise, and it
         # must not point yt-dlp at a file that does not exist.
         videokit.probe("u")
         self.assertEqual(self._cookies_used(), set())
+
+    def test_a_crlf_write_back_does_not_poison_the_stored_credential(self):
+        # yt-dlp saves the cookie jar after every run, and its writer emits
+        # CRLF on Windows. The next call then sends the CR as part of the
+        # value; on 2026-10-17 that made --dump-single-json fail. The stored
+        # file must survive that write-back untouched.
+        videokit.save_cookies(CDP_COOKIES, videokit.credentials_path())
+        source = videokit.credentials_path()
+        before = source.read_bytes()
+
+        def poisoning_run(cmd, **kwargs):
+            if "--cookies" in cmd:
+                path = Path(cmd[cmd.index("--cookies") + 1])
+                path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+            class R:
+                returncode = 0
+                stdout = MULTI_DUMP if "--dump-single-json" in cmd else MULTI_SUBS
+                stderr = ""
+
+            return R()
+
+        subprocess.run = poisoning_run
+        videokit.probe("u")
+        self.assertEqual(source.read_bytes(), before)
+        self.assertNotIn(b"\r", source.read_bytes())
 
 
 class GitignoreCoverage(unittest.TestCase):
