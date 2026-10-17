@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "videokit"
 version = "0.1.0"
@@ -25,3 +29,8 @@ dependencies = ["websocket-client>=1.7"]
 #   uv sync --extra asr
 [project.optional-dependencies]
 asr = ["funasr>=1.4", "torch>=2.0", "kaldi-native-fbank>=1.20"]
+
+# The backend imports videokit as a library, so the module needs an installable
+# shape. It is a single top-level module, not a package.
+[tool.setuptools]
+py-modules = ["videokit"]

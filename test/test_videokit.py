@@ -468,6 +468,14 @@ class CredentialFile(unittest.TestCase):
         videokit.save_cookies(CDP_COOKIES, target)
         self.assertEqual(rows(target.read_text(encoding="utf-8")), NETSCAPE_REFERENCE)
 
+    def test_writes_lf_even_on_windows(self):
+        # yt-dlp sends the trailing byte of each line as part of the cookie
+        # value. A CRLF file reset the JSON metadata request on the real site,
+        # measured 2026-10-17, so the bytes must be LF on every platform.
+        target = self.tmp / "cookies.txt"
+        videokit.save_cookies(CDP_COOKIES, target)
+        self.assertNotIn(b"\r", target.read_bytes())
+
     def test_other_accounts_on_the_machine_cannot_read_it(self):
         # The file holds a live session token, and the directory holds the
         # browser profile that yields it. Either one readable by another
@@ -1859,6 +1867,25 @@ class SkipExisting(unittest.TestCase):
         self.assertEqual(len(probed), 1)
         listed = [a for a in self.calls[before:] if "--list-subs" in a]
         self.assertEqual(len(listed), 1)
+
+    def test_a_held_probe_result_means_no_second_probe(self):
+        # The workbench just showed the operator this Video. Asking again costs
+        # about 75 seconds and gives the site another chance to reset the
+        # connection, measured 2026-10-17.
+        video = videokit.probe("https://www.bilibili.com/video/BV1Y5QgB5Eas")
+        before = len(self.calls)
+        records = videokit.transcripts(
+            "https://www.bilibili.com/video/BV1Y5QgB5Eas",
+            self.out,
+            parts=[23],
+            audio_dir=self.audio,
+            video=video,
+        )
+        self.assertEqual(
+            [a for a in self.calls[before:] if "--dump-single-json" in a], []
+        )
+        self.assertEqual([a for a in self.calls[before:] if "--list-subs" in a], [])
+        self.assertEqual([r.index for r in records], [23])
 
     def test_two_runs_leave_no_state_behind_in_the_output_directory(self):
         # The only thing persisted is the artifact itself. A state file beside

@@ -281,7 +281,14 @@ def save_cookies(cookies: list[dict], path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _restrict_to_current_account(path.parent, inheritable=True)
-    path.write_text(netscape_text(cookies), encoding="utf-8")
+    # newline="\n" is load-bearing on Windows. Text mode would turn every
+    # line ending into CRLF, and yt-dlp reads the trailing CR as part of the
+    # cookie value. Measured on 2026-10-17: a CRLF credential file failed
+    # --dump-single-json with "Remote end closed connection without response"
+    # while an LF copy of the same file succeeded, and --list-subs tolerated
+    # both. The site was intermittent that day, so this is one measured pair,
+    # not proof that CRLF is the only cause.
+    path.write_text(netscape_text(cookies), encoding="utf-8", newline="\n")
     _restrict_to_current_account(path, inheritable=False)
     return path
 
@@ -1355,6 +1362,7 @@ def transcripts(
     audio_dir: Path | None = None,
     engine=None,
     device: str = "cpu",
+    video: Video | None = None,
 ) -> tuple[PartTranscript, ...]:
     """Judge every part of `url` and deliver one transcript per part.
 
@@ -1391,7 +1399,12 @@ def transcripts(
     batch. `_DeferredEngine` defers the load until a part actually needs it,
     and a caller that already holds an engine passes it in as `engine`.
     """
-    video = probe(video_url(url), cookies)
+    # A caller that just probed can hand the result in. The probe is 75
+    # seconds measured against the real course, and it is a second chance for
+    # the site to reset the connection. The workbench already holds the Video
+    # it showed the operator, so it passes it rather than asking again.
+    if video is None:
+        video = probe(video_url(url), cookies)
     if parts is not None:
         # A requested part number that does not exist has to be refused, not
         # filtered away. Measured, `--parts 99` on a 30-part course silently
