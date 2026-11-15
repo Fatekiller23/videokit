@@ -328,6 +328,19 @@ def subtitle_path(source: Path, out_dir: Path | None = None) -> Path:
     return (Path(out_dir) if out_dir else Path(source).parent) / f"{Path(source).stem}.srt"
 
 
+def write_srt_text(path: Path, text: str) -> Path:
+    """写 SRT 文件。含非 ASCII 字符时带 UTF-8 BOM。
+
+    实测：VLC 在中文 Windows 上按系统代码页（cp936）读没有 BOM 的 SRT，UTF-8 的中文
+    全部变成乱码（「我是」显示成「鎴戞槸」）。带 BOM 的同一份文件按 UTF-8 读，显示正常。
+    纯 ASCII 不加 BOM，免得老工具把 BOM 当正文。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_bom = any(ord(char) > 127 for char in text)
+    path.write_text(text, encoding="utf-8-sig" if needs_bom else "utf-8")
+    return path
+
+
 def write_subtitles(
     source: Path,
     segments: Sequence[Segment],
@@ -335,10 +348,10 @@ def write_subtitles(
     max_chars: int = DEFAULT_MAX_CHARS,
     max_lines: int = DEFAULT_MAX_LINES,
 ) -> Path:
-    path = subtitle_path(Path(source), out_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(srt_text(segments, max_chars, max_lines), encoding="utf-8")
-    return path
+    return write_srt_text(
+        subtitle_path(Path(source), out_dir),
+        srt_text(segments, max_chars, max_lines),
+    )
 
 
 def sources_of(reference: str | Path) -> list[Path]:

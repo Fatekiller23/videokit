@@ -119,6 +119,18 @@ def test_transcribe_audio_passes_an_array_not_a_path(tmp_path):
     assert [(s.start_sec, s.end_sec, s.text) for s in segments] == [(0.0, 1.0, "hello world")]
 
 
+def test_srt_with_chinese_gets_a_utf8_bom(tmp_path):
+    target = tmp_path / "zh.srt"
+    local.write_srt_text(target, "1\n00:00:00,000 --> 00:00:01,000\n我是中文\n")
+    assert target.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_srt_with_ascii_only_has_no_bom(tmp_path):
+    target = tmp_path / "en.srt"
+    local.write_srt_text(target, "1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+    assert not target.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
 def test_unknown_container_is_refused(tmp_path):
     target = tmp_path / "a.xyz"
     target.write_bytes(b"")

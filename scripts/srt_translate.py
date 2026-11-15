@@ -148,12 +148,27 @@ def _is_mostly_ascii(text: str) -> bool:
     return len(ascii_letters) / len(letters) > 0.9
 
 
+def write_text(path: Path, text: str, bom: bool = True) -> Path:
+    """写 SRT。含非 ASCII 字符时带 UTF-8 BOM。
+
+    实测：VLC 在中文 Windows 上按系统代码页（cp936）读没有 BOM 的 SRT，UTF-8 的
+    中文全部变成乱码（「我是」显示成「鎴戞槸」）。带 BOM 的同一份文件按 UTF-8 读，
+    显示正常。纯 ASCII 的文件不加 BOM，免得老工具把 BOM 当正文。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    needs_bom = bom and any(ord(char) > 127 for char in text)
+    path.write_text(text, encoding="utf-8-sig" if needs_bom else "utf-8")
+    return path
+
+
 def merge(
     chunk_dir: Path,
     srt_path: Path,
     out_path: Path,
     width: int = DEFAULT_WIDTH,
     bilingual: bool = False,
+    bom: bool = True,
 ) -> tuple[Path, dict]:
     """把各块的译文拼回 SRT。时间轴与编号来自原文，只换文本。"""
     cues = read_srt(srt_path)
@@ -189,10 +204,8 @@ def merge(
         if bilingual:
             body += "\n" + "\n".join(_fit_lines(cue.text, 42, 2, latin=True))
         blocks.append(f"{index}\n{_stamp(cue.start)} --> {_stamp(cue.end)}\n{body}")
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
-    return out_path, report
+    write_text(Path(out_path), "\n\n".join(blocks) + "\n", bom)
+    return Path(out_path), report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     merge_cmd.add_argument("--out", required=True)
     merge_cmd.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     merge_cmd.add_argument("--bilingual", action="store_true")
+    merge_cmd.add_argument("--no-bom", action="store_true", help="不写 UTF-8 BOM")
 
     args = parser.parse_args(argv)
     if args.command == "split":
@@ -217,7 +231,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"拆成 {len(written)} 块：{Path(args.out)}")
         return 0
 
-    path, report = merge(Path(args.dir), Path(args.srt), Path(args.out), args.width, args.bilingual)
+    path, report = merge(
+        Path(args.dir), Path(args.srt), Path(args.out), args.width, args.bilingual, not args.no_bom
+    )
     print(f"写出 {path}")
     print(json.dumps(report, ensure_ascii=False))
     if report["missing_count"]:
