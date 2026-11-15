@@ -122,6 +122,23 @@ def test_bilingual_cue_has_at_most_four_body_lines(tmp_path):
         assert len(body) <= 4, body
 
 
+def test_utf8_bom_written_when_text_has_chinese(tmp_path):
+    path = st.write_text(tmp_path / "a.srt", "1\n00:00:00,000 --> 00:00:01,000\n我是中文\n")
+    raw = path.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "no BOM means VLC reads cp936 and shows mojibake"
+    assert raw.decode("utf-8-sig").strip().endswith("我是中文")
+
+
+def test_no_bom_for_pure_ascii(tmp_path):
+    path = st.write_text(tmp_path / "b.srt", "1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_no_bom_option(tmp_path):
+    path = st.write_text(tmp_path / "c.srt", "中文\n", bom=False)
+    assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
 def test_mostly_ascii_detects_untranslated_lines():
     assert st._is_mostly_ascii("this is still english")
     assert not st._is_mostly_ascii("这是中文")

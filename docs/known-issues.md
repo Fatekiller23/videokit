@@ -33,6 +33,17 @@ PCM，转成 float32 数组，交给 `model.transcribe(array)`。这是上游支
 见 `docs/bilibili-pipeline.md`「已知限制」第一条。与本仓的本地链路无关，但同一环境里
 跑两个子命令时容易撞上。
 
+## 没有 BOM 的 SRT 在 VLC 上是乱码
+
+现象：中文字幕显示成「鎴戞槸 Teddy Atlas，」，英文行正常。
+
+原因：文件是合法 UTF-8，但没有 BOM。VLC 在中文 Windows 上对没有 BOM 的字幕文件
+按系统代码页（cp936）解码，UTF-8 字节就被当成 GBK。实测 2026-11-15，
+`[Text.Encoding]::GetEncoding(936).GetString(utf8Bytes)` 得到的正是那串乱码。
+
+修法：含非 ASCII 字符时写 `utf-8-sig`。纯 ASCII 文件不加，因为两种代码页字节相同，
+加 BOM 反而给老工具添乱。`write_text` / `write_srt_text` 按这条规则写。
+
 ## 控制台是 cp936
 
 讲次标题来自平台，可能含 U+20000 或 emoji。`main` 把自己的两个流包一层替换降级，

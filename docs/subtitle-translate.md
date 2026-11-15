@@ -59,6 +59,10 @@ python scripts/srt_translate.py merge <目录> --srt <原文.srt> --out <译文.
 
 `<视频名>.zh.srt`，与原文 SRT 并排放。`--bilingual` 会写成中文在上、英文在下。
 
+**含中文时写 UTF-8 BOM。** 实测 VLC 在中文 Windows 上按 cp936 读没有 BOM 的 SRT，
+中文全变乱码（「我是」显示成「鎴戞槸」）。带 BOM 就按 UTF-8 读。纯 ASCII 不加 BOM。
+`--no-bom` 可以关掉。
+
 ## 实测
 
 三卷，每块 50 条，块数分别是 13、12、21（共 46 个块，由 46 个 agent 并行完成）。
