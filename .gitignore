@@ -6,6 +6,9 @@ build/
 dist/
 .pytest_cache/
 
+# 分段翻译的中间件，一次几百个小文件，不提交。
+/var/
+
 # 命令行省略 --out / --audio-out 时的默认落点。一次全量是上百 MB 到 GB 级，
 # 一句 git add -A 就会全进索引。只锚在仓库根，不吞同名源码目录。
 /audio/
