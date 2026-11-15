@@ -4,33 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "videokit"
-version = "0.1.0"
-description = "B 站视频探测、下载与转文稿"
+version = "0.2.0"
+description = "视频转文稿与字幕：B 站链接一条入口，本地文件一条入口"
 requires-python = ">=3.12"
 
-# websocket-client is the CDP transport. It is the only dependency the probe,
-# download and subtitle paths need; yt-dlp and ffmpeg are external programs.
+# websocket-client 是 CDP 传输。探针、下载、平台字幕三条路径只需要它；
+# yt-dlp 与 ffmpeg 是外部程序，不进这里。
 dependencies = ["websocket-client>=1.7"]
 
-# Speech recognition, kept in an extra rather than in the base install because
-# it is roughly 2 GB and most callers never transcribe anything. Probing,
-# downloading and subtitle retrieval all work without it.
-#
-# All three are required, and the third is the one that is easy to miss.
-# `funasr` and `torch` alone install cleanly and load a model successfully,
-# then fail the moment audio arrives, measured on this machine as
-# `ImportError: torchaudio is not installed and neither is the
-# kaldi-native-fbank fallback backend. FunASR needs one fbank backend for
-# feature extraction.`
-#
-# Either backend satisfies it. This package names kaldi-native-fbank because it
-# does not pin a torch version the way torchaudio does.
-#
-#   uv sync --extra asr
 [project.optional-dependencies]
+# 中文语音识别。约 2 GB，大多数调用方从不转写，所以放 extra。
+# 三者缺一不可，第三个最容易漏：只有 funasr 与 torch 时能装能加载模型，
+# 一喂音频就报 torchaudio / kaldi-native-fbank 缺失。详见 docs/bilibili-pipeline.md。
 asr = ["funasr>=1.4", "torch>=2.0", "kaldi-native-fbank>=1.20"]
 
-# The backend imports videokit as a library, so the module needs an installable
-# shape. It is a single top-level module, not a package.
-[tool.setuptools]
-py-modules = ["videokit"]
+# 本地文件的语音识别走 faster-whisper。英语是它的强项，中文也能量产。
+#
+# 1.2.1 在 PyAV 19 上崩溃（av.open() 不接受 metadata_errors，该参数在 PyAV 19
+# 被删除）。绕法是本包自己的：ffmpeg 解成 float32 数组后交给 model.transcribe，
+# 完全不进 av.open。所以这里不钉 av 的版本，也不靠上游修。实测记录见
+# docs/research 里的 known-issues。
+#
+# CUDA 运行库单独列，因为 ctranslate2 在 Windows 上要自己 LoadLibrary 找它们。
+whisper = ["faster-whisper>=1.1"]
+
+[project.scripts]
+videokit = "videokit:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+dev = ["pytest>=8"]

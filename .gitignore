@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# 命令行省略 --out / --audio-out 时的默认落点。一次全量是上百 MB 到 GB 级，
+# 一句 git add -A 就会全进索引。只锚在仓库根，不吞同名源码目录。
+/audio/
+/video/
+/videos/
+/transcripts/
+
+# 登录凭据与浏览器 profile 落在仓库外（default_data_dir），这两条是兜底：
+# 有人把它们复制进仓库时，仍然提交不了。
+cookies*.txt
+/browser-profile/

@@ -2369,7 +2369,7 @@ def transcribe(
 # a reader who cannot tell them apart picks the wrong one and downloads an hour
 # of video to transcribe.
 
-_USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
+_USAGE = """usage: videokit <子命令> <BV号或链接或本地文件> [选项]
 
 子命令
   probe       探测。报告有多少讲、每讲多长、哪些有字幕、有哪些清晰度档位。
@@ -2380,6 +2380,8 @@ _USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
   transcript  转文稿。有字幕的讲次取平台字幕，无字幕的取音频跑本地语音识别，
               两者都写成交付文稿，一条命令跑完。
   login       登录一次。拉起浏览器扫码，凭据落盘，之后不必再登。
+  srt         字幕。把本地视频文件转成 SRT。本地没有平台字幕可查，
+              一律走语音识别，产物是与视频同名的 .srt。
 
 选项
   --parts 3,4        只处理这几讲。省略表示全部讲次。
@@ -2393,6 +2395,7 @@ _USAGE = """usage: videokit <子命令> <BV号或链接> [选项]
   videokit video BV1Y5QgB5Eas --quality 720p --parts 3,4 --out videos
   videokit audio BV1Y5QgB5Eas --out audio
   videokit transcript BV1Y5QgB5Eas --out transcripts
+  videokit srt "D:\videos" --out subtitles
 
 退出码
   0   成功。transcript 下含「全部跳过」的情况，跳过是已完成的工作。
@@ -2426,6 +2429,12 @@ _SUBCOMMANDS: dict[str, tuple[str, str]] = {
         "两者都写成交付文稿，不需要另跑一条命令。已有产物的讲次跳过。"
         "结尾按 ok / skipped / failed 分类汇总，任何一讲 failed 时退出码非零。",
     ),
+    "srt": (
+        "videokit srt <本地文件或目录> [--out 目录] [--model large-v3] "
+        "[--device auto] [--language en]",
+        "本地视频转 SRT 字幕。抽 16 kHz 单声道音频，用 faster-whisper 转写，"
+        "按时间戳写 .srt。省略 --out 时落在视频旁边。目录参数取其中所有视频。",
+    ),
     "login": (
         "videokit login",
         "登录一次。拉起浏览器窗口，扫码后把凭据落盘，"
@@ -2438,6 +2447,9 @@ _OPTIONS_HELP = """选项
   --out 目录         产物写到这里。
   --audio-out 目录   transcript 用的音频落点。
   --quality 720p     视频清晰度，仅 video 用。可选 360p / 480p / 720p / 1080p。
+  --model large-v3   仅 srt。Whisper 模型名，省略用 large-v3。
+  --device auto      仅 srt。auto / cuda / cpu。auto 先试显卡，起不来退 CPU。
+  --language en      仅 srt。指定语种，省略由模型自己判定。
   -h, --help         显示帮助。
 """
 
@@ -2446,7 +2458,10 @@ _HELP_FLAGS = ("-h", "--help")
 
 # Every option that takes a value. Named once so `_dispatch` can refuse a
 # trailing option for all of them, rather than each subcommand remembering.
-_VALUE_OPTIONS = ("--parts", "--out", "--audio-out", "--quality")
+_VALUE_OPTIONS = (
+    "--parts", "--out", "--audio-out", "--quality",
+    "--model", "--device", "--language",
+)
 
 
 def _wants_help(args: list[str]) -> bool:
@@ -2557,6 +2572,10 @@ def _dispatch(argv: list[str]) -> int:
         return _audio_command(rest)
     if name == "transcript":
         return _transcript_command(rest)
+    if name == "srt":
+        from .local import srt_command
+
+        return srt_command(rest)
     return _login_command(rest)
 
 

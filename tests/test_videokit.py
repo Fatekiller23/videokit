@@ -4,7 +4,7 @@ Imports the real module. The only thing stubbed is the yt-dlp subprocess:
 the spec swaps in recorded output captured from a real run, so parsing and
 data-shaping are exercised against bytes yt-dlp actually produces.
 
-Run: python test/test_videokit.py
+Run: python -m pytest
 """
 
 from __future__ import annotations
@@ -20,7 +20,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO = Path(__file__).resolve().parents[1]
+MODULE = REPO / "src" / "videokit" / "__init__.py"
+SPEC = REPO / "docs" / "bilibili-pipeline.md"
+
+sys.path.insert(0, str(REPO / "src"))
 
 import videokit  # noqa: E402
 
@@ -1026,7 +1030,7 @@ class GitignoreCoverage(unittest.TestCase):
     """
 
     def setUp(self):
-        self.repo = Path(__file__).resolve().parents[3]
+        self.repo = REPO
         self.gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
 
     def test_credential_lives_outside_the_working_tree(self):
@@ -1072,21 +1076,21 @@ class GitignoreCoverage(unittest.TestCase):
         for name in ("audio", "video", "videos", "transcripts"):
             with self.subTest(dir=name):
                 proc = subprocess.run(
-                    ["git", "check-ignore", "-v", f"packages/VideoKit/{name}/x"],
+                    ["git", "check-ignore", "-v", f"{name}/x"],
                     cwd=self.repo,
                     capture_output=True,
                     text=True,
                 )
                 self.assertEqual(proc.returncode, 0, f"{name}/ not ignored")
-                self.assertIn(f"packages/VideoKit/{name}/", proc.stdout)
+                self.assertIn(f"/{name}/", proc.stdout)
 
     def test_the_ignore_rules_do_not_swallow_the_package(self):
         # The rule must be narrow enough that ordinary source and fixtures stay
         # committable. An unanchored `audio/` would also hide any future source
         # directory of that name anywhere in the tree.
         for kept in (
-            "packages/VideoKit/videokit.py",
-            "packages/VideoKit/test/fixtures/dump-multipart.json",
+            "src/videokit/__init__.py",
+            "tests/fixtures/dump-multipart.json",
         ):
             with self.subTest(path=kept):
                 proc = subprocess.run(
@@ -2398,7 +2402,7 @@ raise SystemExit(0)  # Reached only if the write never swapped.
         self.addCleanup(self._cleanup)
         self.out = self.tmp / "transcripts"
         self.out.mkdir(parents=True)
-        self.package = str(Path(__file__).resolve().parent.parent)
+        self.package = str(REPO / "src")
 
     def _cleanup(self):
         for child in sorted(self.tmp.rglob("*"), reverse=True):
@@ -3200,7 +3204,7 @@ class FailureSurvival(unittest.TestCase):
         self.assertEqual(record.status, "failed")
         self.assertEqual(record.failure_reason, "no_audio")
         source = (
-            Path(__file__).resolve().parent.parent / "videokit.py"
+            MODULE
         ).read_text(encoding="utf-8")
         self.assertNotIn('"pending"', source)
 
@@ -3499,7 +3503,7 @@ class AsrDependencies(unittest.TestCase):
     def test_the_filler_word_decision_is_written_down(self):
         # The ticket asks for this in the README, and a decision that is only
         # in a commit message gets reverted by the next person.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        readme = (SPEC).read_text(
             encoding="utf-8"
         )
         self.assertIn("填充词", readme)
@@ -3509,7 +3513,7 @@ class AsrDependencies(unittest.TestCase):
         # punctuation on the platform side, and no Simplified to Traditional
         # conversion. A tradeoff that lives only in a commit message gets
         # reverted by the next person.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        readme = (SPEC).read_text(
             encoding="utf-8"
         )
         self.assertIn("无标点", readme)
@@ -3519,7 +3523,7 @@ class AsrDependencies(unittest.TestCase):
         # `opencc` is the only correct name. Two similarly named packages
         # convert character by character and mistranslate 头发 into 頭發, so
         # naming the wrong one is a silent error rather than a crash.
-        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(
+        readme = (SPEC).read_text(
             encoding="utf-8"
         )
         self.assertIn("opencc", readme)
@@ -3531,7 +3535,7 @@ class AsrDependencies(unittest.TestCase):
         # not only in the README. The module's comments are in English, so the
         # markers asserted here are the English ones.
         source = (
-            Path(__file__).resolve().parent.parent / "videokit.py"
+            MODULE
         ).read_text(encoding="utf-8")
         self.assertIn("opencc", source)
         self.assertIn("头发", source)
