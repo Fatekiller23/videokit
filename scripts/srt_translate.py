@@ -117,6 +117,29 @@ def _wrap_cjk(text: str, width: int = DEFAULT_WIDTH) -> list[str]:
     return lines
 
 
+def _fit_lines(text: str, width: int, max_lines: int, latin: bool) -> list[str]:
+    """把文本折成最多 max_lines 行，放不下就加宽，不丢字。
+
+    先按给定宽度折。折出来超过行数上限时加宽到 `ceil(字数/行数)` 再折一次。
+    两条路径都试过还超（极长的无空格串），宁可多出一行也不截断：字幕丢半句比
+    多一行难发现得多。
+    """
+    text = " ".join(text.split())
+    if not text:
+        return []
+    candidate = max(width, -(-len(text) // max_lines))
+    wrapped: list[str] = [text]
+    while candidate <= len(text):
+        if latin:
+            wrapped = textwrap.wrap(text, width=candidate, break_long_words=True)
+        else:
+            wrapped = _wrap_cjk(text, candidate)
+        if len(wrapped) <= max_lines:
+            return wrapped
+        candidate = int(candidate * 1.2) + 1
+    return wrapped
+
+
 def _is_mostly_ascii(text: str) -> bool:
     letters = [ch for ch in text if ch.isalpha()]
     if not letters:
@@ -162,14 +185,9 @@ def merge(
         chinese = translations.get(index) or cue.text
         if index in translations and _is_mostly_ascii(chinese) and not _is_mostly_ascii(cue.text):
             report["untranslated_looking"].append(index)
-        lines = _wrap_cjk(chinese, width)
-        if len(lines) > 2:
-            # 两行装不下就压到两行：按字数平分。字幕多于两行会盖住画面。
-            pack = textwrap.wrap(chinese, width=max(width, -(-len(chinese) // 2)), break_long_words=True)
-            lines = pack[:2]
-        body = "\n".join(lines)
+        body = "\n".join(_fit_lines(chinese, width, 2, latin=False))
         if bilingual:
-            body += "\n" + "\n".join(_wrap_cjk(cue.text, 42))
+            body += "\n" + "\n".join(_fit_lines(cue.text, 42, 2, latin=True))
         blocks.append(f"{index}\n{_stamp(cue.start)} --> {_stamp(cue.end)}\n{body}")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

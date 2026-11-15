@@ -93,6 +93,35 @@ def test_cjk_wrap_hard_breaks_without_punctuation():
     assert [len(line) for line in lines] == [20, 20, 5]
 
 
+def test_fit_lines_never_truncates_chinese():
+    # 78 个字按 20 字一行需要 4 行，超过两行上限。折完必须一个字都不少。
+    text = "这是一句很长的中文字幕" * 7
+    lines = st._fit_lines(text, 20, 2, latin=False)
+    assert len(lines) <= 2
+    assert "".join(lines).replace(" ", "") == text
+
+
+def test_fit_lines_never_truncates_latin():
+    text = " ".join(["instructional"] * 9)
+    lines = st._fit_lines(text, 42, 2, latin=True)
+    assert len(lines) <= 2
+    assert " ".join(lines).split() == text.split()
+
+
+def test_bilingual_cue_has_at_most_four_body_lines(tmp_path):
+    source = _write(tmp_path)
+    directory = tmp_path / "chunks"
+    st.split(source, directory, size=3)
+    long_zh = "这是一句很长的中文字幕" * 5
+    (directory / "01.zh.txt").write_text(
+        f"0001|{long_zh}\n0002|第二行\n0003|第三条。\n", encoding="utf-8"
+    )
+    out, _ = st.merge(directory, source, tmp_path / "bi.srt", bilingual=True)
+    for block in out.read_text(encoding="utf-8").strip().split("\n\n"):
+        body = block.splitlines()[2:]
+        assert len(body) <= 4, body
+
+
 def test_mostly_ascii_detects_untranslated_lines():
     assert st._is_mostly_ascii("this is still english")
     assert not st._is_mostly_ascii("这是中文")
