@@ -127,6 +127,8 @@ def _fit_lines(text: str, width: int, max_lines: int, latin: bool) -> list[str]:
     text = " ".join(text.split())
     if not text:
         return []
+    if max_lines <= 1:
+        return [text]
     candidate = max(width, -(-len(text) // max_lines))
     wrapped: list[str] = [text]
     while candidate <= len(text):
@@ -169,6 +171,7 @@ def merge(
     width: int = DEFAULT_WIDTH,
     bilingual: bool = False,
     bom: bool = True,
+    lines: int = 1,
 ) -> tuple[Path, dict]:
     """把各块的译文拼回 SRT。时间轴与编号来自原文，只换文本。"""
     cues = read_srt(srt_path)
@@ -200,12 +203,23 @@ def merge(
         chinese = translations.get(index) or cue.text
         if index in translations and _is_mostly_ascii(chinese) and not _is_mostly_ascii(cue.text):
             report["untranslated_looking"].append(index)
-        body = "\n".join(_fit_lines(chinese, width, 2, latin=False))
+        body = "\n".join(_fit_lines(chinese, width, lines, latin=False))
         if bilingual:
-            body += "\n" + "\n".join(_fit_lines(cue.text, 42, 2, latin=True))
+            body += "\n" + "\n".join(_fit_lines(cue.text, 42, lines, latin=True))
         blocks.append(f"{index}\n{_stamp(cue.start)} --> {_stamp(cue.end)}\n{body}")
     write_text(Path(out_path), "\n\n".join(blocks) + "\n", bom)
     return Path(out_path), report
+
+
+def rewrap(srt_path: Path, out_path: Path, lines: int = 1, width: int = 42) -> Path:
+    """只改折行，不改文本与时间轴。用来把已经生成的 SRT 收成一行。"""
+    cues = read_srt(srt_path)
+    blocks: list[str] = []
+    for index, cue in enumerate(cues, start=1):
+        body = "\n".join(_fit_lines(cue.text, width, lines, latin=_is_mostly_ascii(cue.text)))
+        blocks.append(f"{index}\n{_stamp(cue.start)} --> {_stamp(cue.end)}\n{body}")
+    write_text(Path(out_path), "\n\n".join(blocks) + "\n")
+    return Path(out_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,15 +238,30 @@ def main(argv: list[str] | None = None) -> int:
     merge_cmd.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     merge_cmd.add_argument("--bilingual", action="store_true")
     merge_cmd.add_argument("--no-bom", action="store_true", help="不写 UTF-8 BOM")
+    merge_cmd.add_argument(
+        "--lines", type=int, default=1, choices=(1, 2),
+        help="每个语种最多几行，默认 1（一条字幕一行）",
+    )
+
+    rewrap_cmd = sub.add_parser("rewrap", help="只改折行，不改文本与时间轴")
+    rewrap_cmd.add_argument("srt")
+    rewrap_cmd.add_argument("--out", required=True)
+    rewrap_cmd.add_argument("--lines", type=int, default=1, choices=(1, 2))
+    rewrap_cmd.add_argument("--width", type=int, default=42)
 
     args = parser.parse_args(argv)
+    if args.command == "rewrap":
+        path = rewrap(Path(args.srt), Path(args.out), args.lines, args.width)
+        print(f"写出 {path}")
+        return 0
     if args.command == "split":
         written = split(Path(args.srt), Path(args.out), args.size)
         print(f"拆成 {len(written)} 块：{Path(args.out)}")
         return 0
 
     path, report = merge(
-        Path(args.dir), Path(args.srt), Path(args.out), args.width, args.bilingual, not args.no_bom
+        Path(args.dir), Path(args.srt), Path(args.out), args.width,
+        args.bilingual, not args.no_bom, args.lines,
     )
     print(f"写出 {path}")
     print(json.dumps(report, ensure_ascii=False))
