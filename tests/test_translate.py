@@ -117,9 +117,9 @@ def test_bilingual_cue_has_at_most_four_body_lines(tmp_path):
         f"0001|{long_zh}\n0002|第二行\n0003|第三条。\n", encoding="utf-8"
     )
     out, _ = st.merge(directory, source, tmp_path / "bi.srt", bilingual=True)
-    for block in out.read_text(encoding="utf-8").strip().split("\n\n"):
+    for block in out.read_text(encoding="utf-8-sig").strip().split("\n\n"):
         body = block.splitlines()[2:]
-        assert len(body) <= 4, body
+        assert len(body) <= 2, body
 
 
 def test_utf8_bom_written_when_text_has_chinese(tmp_path):
@@ -137,6 +137,55 @@ def test_no_bom_for_pure_ascii(tmp_path):
 def test_no_bom_option(tmp_path):
     path = st.write_text(tmp_path / "c.srt", "中文\n", bom=False)
     assert not path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_merge_default_is_one_line_per_language(tmp_path):
+    source = _write(tmp_path)
+    directory = tmp_path / "chunks"
+    st.split(source, directory, size=3)
+    long_zh = "这是一句很长的中文字幕" * 3
+    (directory / "01.zh.txt").write_text(
+        f"0001|{long_zh}\n0002|第二行\n0003|第三条。\n", encoding="utf-8"
+    )
+    out, _ = st.merge(directory, source, tmp_path / "zh.srt")
+    for block in out.read_text(encoding="utf-8-sig").strip().split("\n\n"):
+        assert len(block.splitlines()[2:]) == 1, block
+
+
+def test_merge_two_lines_when_asked(tmp_path):
+    source = _write(tmp_path)
+    directory = tmp_path / "chunks"
+    st.split(source, directory, size=3)
+    long_zh = "这是一句很长的中文字幕" * 3
+    (directory / "01.zh.txt").write_text(
+        f"0001|{long_zh}\n0002|第二行\n0003|第三条。\n", encoding="utf-8"
+    )
+    out, _ = st.merge(directory, source, tmp_path / "zh2.srt", lines=2)
+    bodies = [len(b.splitlines()[2:]) for b in out.read_text(encoding="utf-8-sig").strip().split("\n\n")]
+    assert max(bodies) == 2
+
+
+def test_bilingual_default_is_two_lines_total(tmp_path):
+    source = _write(tmp_path)
+    directory = tmp_path / "chunks"
+    st.split(source, directory, size=3)
+    (directory / "01.zh.txt").write_text(
+        "0001|你好。\n0002|第二行。\n0003|第三条。\n", encoding="utf-8"
+    )
+    out, _ = st.merge(directory, source, tmp_path / "bi.srt", bilingual=True)
+    for block in out.read_text(encoding="utf-8-sig").strip().split("\n\n"):
+        assert len(block.splitlines()[2:]) == 2, block
+
+
+def test_rewrap_keeps_text_and_times(tmp_path):
+    source = _write(tmp_path)
+    out = st.rewrap(source, tmp_path / "one.srt", lines=1)
+    cues = st.read_srt(out)
+    original = st.read_srt(source)
+    assert [c.text for c in cues] == [c.text for c in original]
+    assert [c.start for c in cues] == [c.start for c in original]
+    for block in out.read_text(encoding="utf-8-sig").strip().split("\n\n"):
+        assert len(block.splitlines()[2:]) == 1
 
 
 def test_mostly_ascii_detects_untranslated_lines():
